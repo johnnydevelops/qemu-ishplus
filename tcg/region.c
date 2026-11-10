@@ -768,6 +768,14 @@ static void *ios_debugger_alloc_rx(size_t size)
     return (void *)x0;
 }
 
+/* Tell the JIT enabler we are done, so it detaches: x16 = 0, brk #0xf00d. */
+static void ios_debugger_detach(void)
+{
+    register uint64_t x16 asm("x16") = 0;
+
+    asm volatile("brk #0xf00d" : : "r"(x16) : "memory");
+}
+
 /*
  * The executable view comes from the debugger (or, without one, from our own
  * read-execute mapping, which only works on older iOS); QEMU writes through a
@@ -779,9 +787,11 @@ static int alloc_code_gen_buffer_splitwx_ios(size_t size, Error **errp)
     mach_vm_address_t buf_rw = 0;
     vm_prot_t cur_prot, max_prot;
     void *buf_rx = NULL;
+    bool from_debugger = false;
 
     if (is_debugger_attached()) {
         buf_rx = ios_debugger_alloc_rx(size);
+        from_debugger = buf_rx != NULL;
         if (buf_rx == NULL) {
             error_report("JIT: the debugger did not allocate executable memory");
         }
@@ -810,6 +820,9 @@ static int alloc_code_gen_buffer_splitwx_ios(size_t size, Error **errp)
     region.start_aligned = (void *)buf_rw;
     region.total_size = size;
     tcg_splitwx_diff = buf_rx - (void *)buf_rw;
+    if (from_debugger) {
+        ios_debugger_detach();
+    }
     return PROT_READ | PROT_WRITE;
 }
 #endif
