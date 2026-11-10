@@ -844,7 +844,7 @@ size_t qemu_get_host_physmem(void);
  * Toggle write/execute on the pages marked MAP_JIT
  * for the current thread.
  */
-#ifdef __APPLE__
+#if defined(__APPLE__) && !defined(CONFIG_IOS)
 static inline void qemu_thread_jit_execute(void)
 {
     pthread_jit_write_protect_np(true);

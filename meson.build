@@ -507,6 +507,13 @@ else
     supported_backends += ['ucontext']
   endif
   supported_backends += ['sigaltstack']
+  # libucontext: the ucontext backend on top of a user-space implementation of
+  # the context functions, for hosts without a usable makecontext (Darwin, and
+  # iOS, where it is not available at all). Never chosen automatically.
+  libucontext = cc.find_library('ucontext', required: coroutine_backend == 'libucontext')
+  if libucontext.found() and cc.has_header('libucontext/libucontext.h')
+    supported_backends += ['libucontext']
+  endif
 endif
 
 if coroutine_backend == 'auto'
@@ -537,7 +544,7 @@ if get_option('safe_stack') != not cc.compiles(safe_stack_probe)
   qemu_cflags += safe_stack_arg
   qemu_ldflags += safe_stack_arg
 endif
-if get_option('safe_stack') and coroutine_backend != 'ucontext'
+if get_option('safe_stack') and coroutine_backend not in ['ucontext', 'libucontext']
   error('SafeStack is only supported with the ucontext coroutine backend')
 endif
 
@@ -2579,6 +2586,11 @@ if get_option('debug_stack_usage') and have_coroutine_pool
   have_coroutine_pool = false
 endif
 config_host_data.set('CONFIG_COROUTINE_POOL', have_coroutine_pool)
+config_host_data.set('CONFIG_LIBUCONTEXT', coroutine_backend == 'libucontext')
+# iOS is a Darwin host without MAP_JIT for apps, pthread_jit_write_protect_np,
+# IOKit or the ability to start other programs.
+config_host_data.set('CONFIG_IOS', host_os == 'darwin' and \
+    cc.get_define('TARGET_OS_IPHONE', prefix: '#include <TargetConditionals.h>') == '1')
 config_host_data.set('CONFIG_DEBUG_GRAPH_LOCK', get_option('debug_graph_lock'))
 config_host_data.set('CONFIG_DEBUG_MUTEX', get_option('debug_mutex'))
 config_host_data.set('CONFIG_DEBUG_STACK_USAGE', get_option('debug_stack_usage'))
@@ -4409,7 +4421,18 @@ foreach target : target_dirs
                  c_args: c_args,
                  build_by_default: false)
 
-  if target.endswith('-softmmu')
+  if target.endswith('-softmmu') and get_option('embedded')
+    embedded_lib = shared_library('qemu-system-' + target_name,
+               [main_rs, files('system/embedded.c')],
+               install: true,
+               c_args: c_args,
+               dependencies: arch_deps + [target_stubs],
+               objects: lib.extract_all_objects(recursive: true),
+               link_depends: [block_syms, qemu_syms],
+               link_args: link_args)
+    emulators += {'qemu-system-' + target_name: embedded_lib}
+    execs = []
+  elif target.endswith('-softmmu')
     execs = [{
       'name': 'qemu-system-' + target_name,
       'win_subsystem': 'console',

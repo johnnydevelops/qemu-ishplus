@@ -75,7 +75,13 @@ static void tcg_accel_instance_init(Object *obj)
     TCGState *s = TCG_STATE(obj);
 
     /* If debugging enabled, default "auto on", otherwise off. */
-#if defined(CONFIG_DEBUG_TCG) && !defined(CONFIG_USER_ONLY)
+#if defined(CONFIG_IOS) && !defined(CONFIG_USER_ONLY)
+    /*
+     * iOS only allows executable memory through a second, read-execute
+     * mapping of writable memory (while a debugger is attached).
+     */
+    s->splitwx_enabled = 1;
+#elif defined(CONFIG_DEBUG_TCG) && !defined(CONFIG_USER_ONLY)
     s->splitwx_enabled = -1;
 #else
     s->splitwx_enabled = 0;

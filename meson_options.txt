@@ -33,8 +33,10 @@ option('fuzzing_engine', type : 'string', value : '',
        description: 'fuzzing engine library for OSS-Fuzz')
 option('trace_file', type: 'string', value: 'trace',
        description: 'Trace file prefix for simple backend')
+option('embedded', type: 'boolean', value: false,
+       description: 'build system emulators as shared libraries exporting qemu_embedded_main() instead of executables, for hosts that run QEMU in-process (iOS)')
 option('coroutine_backend', type: 'combo',
-       choices: ['ucontext', 'sigaltstack', 'windows', 'wasm', 'auto'],
+       choices: ['ucontext', 'libucontext', 'sigaltstack', 'windows', 'wasm', 'auto'],
        value: 'auto', description: 'coroutine backend to use')
 option('gdb', type: 'string', value: '',
        description: 'Path to GDB')

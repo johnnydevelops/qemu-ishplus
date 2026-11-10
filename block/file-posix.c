@@ -47,6 +47,11 @@
 #include <sys/ioctl.h>
 #endif
 
+#if defined(__APPLE__) && (__MACH__)
+/* fstatfs() is used on every Darwin host, with or without host block devices */
+#include <sys/param.h>
+#include <sys/mount.h>
+#endif
 #if defined(__APPLE__) && (__MACH__) && defined(HAVE_HOST_BLOCK_DEVICE)
 #include <paths.h>
 #include <sys/param.h>

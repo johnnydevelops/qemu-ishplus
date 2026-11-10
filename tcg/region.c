@@ -719,8 +719,8 @@ static int alloc_code_gen_buffer(size_t size, int splitwx, Error **errp)
      */
     prot = PROT_NONE;
     flags = MAP_PRIVATE | MAP_ANONYMOUS;
-#ifdef CONFIG_DARWIN
-    /* Applicable to both iOS and macOS (Apple Silicon). */
+#if defined(CONFIG_DARWIN) && !defined(CONFIG_IOS)
+    /* macOS on Apple Silicon. iOS apps cannot use MAP_JIT; they need split-wx. */
     if (!splitwx) {
         flags |= MAP_JIT;
     }

@@ -34,6 +34,10 @@ meson_options_help() {
   printf "%s\n" '  --enable-debug-stack-usage'
   printf "%s\n" '                           measure coroutine stack usage'
   printf "%s\n" '  --enable-debug-tcg       TCG debugging'
+  printf "%s\n" '  --enable-embedded        build system emulators as shared libraries'
+  printf "%s\n" '                           exporting qemu_embedded_main() instead of'
+  printf "%s\n" '                           executables, for hosts that run QEMU in-process'
+  printf "%s\n" '                           (iOS)'
   printf "%s\n" '  --enable-fdt[=CHOICE]    Whether and how to find the libfdt library'
   printf "%s\n" '                           (choices: auto/disabled/enabled/internal/system)'
   printf "%s\n" '  --enable-fuzzing         build fuzzing targets'
@@ -65,9 +69,9 @@ meson_options_help() {
   printf "%s\n" '  --libdir=VALUE           Library directory [system default]'
   printf "%s\n" '  --libexecdir=VALUE       Library executable directory [libexec]'
   printf "%s\n" '  --localedir=VALUE        Locale data directory [share/locale]'
-  printf "%s\n" '  --localstatedir=VALUE    Localstate data directory [/var/local]'
+  printf "%s\n" '  --localstatedir=VALUE    Localstate data directory [/opt/homebrew/var]'
   printf "%s\n" '  --mandir=VALUE           Manual page directory [share/man]'
-  printf "%s\n" '  --prefix=VALUE           Installation prefix [/usr/local]'
+  printf "%s\n" '  --prefix=VALUE           Installation prefix [/opt/homebrew]'
   printf "%s\n" '  --qemu-ga-distro=VALUE   second path element in qemu-ga registry entries'
   printf "%s\n" '                           [Linux]'
   printf "%s\n" '  --qemu-ga-manufacturer=VALUE'
@@ -79,8 +83,8 @@ meson_options_help() {
   printf "%s\n" '  --sysconfdir=VALUE       Sysconf data directory [etc]'
   printf "%s\n" '  --tls-priority=VALUE     Default TLS protocol/cipher priority string'
   printf "%s\n" '                           [NORMAL]'
-  printf "%s\n" '  --with-coroutine=CHOICE  coroutine backend to use (choices:'
-  printf "%s\n" '                           auto/sigaltstack/ucontext/wasm/windows)'
+  printf "%s\n" '  --with-coroutine=CHOICE  coroutine backend to use (choices: auto/libuconte'
+  printf "%s\n" '                           xt/sigaltstack/ucontext/wasm/windows)'
   printf "%s\n" '  --with-pkgversion=VALUE  use specified string as sub-version of the'
   printf "%s\n" '                           package'
   printf "%s\n" '  --with-suffix=VALUE      Suffix for QEMU data/modules/config directories'
@@ -313,6 +317,8 @@ _meson_option_parse() {
     --disable-docs) printf "%s" -Ddocs=disabled ;;
     --enable-dsound) printf "%s" -Ddsound=enabled ;;
     --disable-dsound) printf "%s" -Ddsound=disabled ;;
+    --enable-embedded) printf "%s" -Dembedded=true ;;
+    --disable-embedded) printf "%s" -Dembedded=false ;;
     --enable-fdt) printf "%s" -Dfdt=enabled ;;
     --disable-fdt) printf "%s" -Dfdt=disabled ;;
     --enable-fdt=*) quote_sh "-Dfdt=$2" ;;
