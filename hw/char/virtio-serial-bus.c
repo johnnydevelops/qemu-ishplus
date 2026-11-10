@@ -246,6 +246,33 @@ static size_t send_control_msg(VirtIOSerial *vser, void *buf, size_t len)
     return len;
 }
 
+/*
+ * Tell the guest a console's terminal size changed, so its tty gets the new
+ * window size (and programs a SIGWINCH). Linux reads cols, then rows.
+ */
+void virtio_serial_send_console_resize(VirtIOSerialPort *port,
+                                       uint16_t cols, uint16_t rows)
+{
+    VirtIOSerial *vser = port->vser;
+    VirtIODevice *vdev;
+    struct {
+        struct virtio_console_control control;
+        uint16_t cols;
+        uint16_t rows;
+    } QEMU_PACKED msg;
+
+    if (!vser) {
+        return;
+    }
+    vdev = VIRTIO_DEVICE(vser);
+    virtio_stl_p(vdev, &msg.control.id, port->id);
+    virtio_stw_p(vdev, &msg.control.event, VIRTIO_CONSOLE_RESIZE);
+    virtio_stw_p(vdev, &msg.control.value, 0);
+    virtio_stw_p(vdev, &msg.cols, cols);
+    virtio_stw_p(vdev, &msg.rows, rows);
+    send_control_msg(vser, &msg, sizeof(msg));
+}
+
 static size_t send_control_event(VirtIOSerial *vser, uint32_t port_id,
                                  uint16_t event, uint16_t value)
 {
@@ -541,6 +568,8 @@ static uint64_t get_features(VirtIODevice *vdev, uint64_t features,
     if (vser->bus.max_nr_ports > 1) {
         virtio_add_feature(&features, VIRTIO_CONSOLE_F_MULTIPORT);
     }
+    /* iSH+: lets the guest act on VIRTIO_CONSOLE_RESIZE (terminal size). */
+    virtio_add_feature(&features, VIRTIO_CONSOLE_F_SIZE);
     return features;
 }
 

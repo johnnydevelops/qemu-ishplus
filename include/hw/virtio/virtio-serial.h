@@ -219,6 +219,10 @@ size_t virtio_serial_guest_ready(VirtIOSerialPort *port);
  * sending data or re-start sending data, depending on the 'throttle'
  * value here.
  */
+/* Report a new terminal size for a console port to the guest. */
+void virtio_serial_send_console_resize(VirtIOSerialPort *port,
+                                       uint16_t cols, uint16_t rows);
+
 void virtio_serial_throttle_port(VirtIOSerialPort *port, bool throttle);
 
 #define TYPE_VIRTIO_SERIAL "virtio-serial-device"

@@ -21,6 +21,8 @@
 #include "qapi/error.h"
 #include "qapi/qapi-events-char.h"
 #include "qom/object.h"
+#include "qemu/main-loop.h"
+#include "hw/sysbus.h"
 
 #define TYPE_VIRTIO_CONSOLE_SERIAL_PORT "virtserialport"
 typedef struct VirtConsole VirtConsole;
@@ -32,6 +34,8 @@ struct VirtConsole {
 
     CharBackend chr;
     guint watch;
+    /* iSH+: the app's terminal size, sent again when the guest opens the port */
+    uint16_t cols, rows;
 };
 
 /*
@@ -116,6 +120,9 @@ static void set_guest_connected(VirtIOSerialPort *port, int guest_connected)
 
     if (!k->is_console) {
         qemu_chr_fe_set_open(&vcon->chr, guest_connected);
+    }
+    if (guest_connected && vcon->cols && vcon->rows) {
+        virtio_serial_send_console_resize(port, vcon->cols, vcon->rows);
     }
 
     if (dev->id) {
@@ -306,3 +313,39 @@ static void virtconsole_register_types(void)
 }
 
 type_init(virtconsole_register_types)
+
+/*
+ * iSH+: called by the app (any thread) when a session's terminal changes
+ * size. id is the virtconsole's device id (-device virtconsole,id=...).
+ */
+__attribute__((visibility("default")))
+int ishplus_console_resize(const char *id, int cols, int rows)
+{
+    bool locked = bql_locked();
+    DeviceState *dev;
+    int ret = -1;
+
+    if (cols <= 0 || rows <= 0 || cols > 0xffff || rows > 0xffff) {
+        return -1;
+    }
+    if (!locked) {
+        bql_lock();
+    }
+    dev = qdev_find_recursive(sysbus_get_default(), id);
+    if (dev && object_dynamic_cast(OBJECT(dev), TYPE_VIRTIO_CONSOLE_SERIAL_PORT)) {
+        VirtConsole *vcon = VIRTIO_CONSOLE(dev);
+        VirtIOSerialPort *port = VIRTIO_SERIAL_PORT(dev);
+
+        vcon->cols = cols;
+        vcon->rows = rows;
+        /* Otherwise sent when the guest opens the port. */
+        if (port->guest_connected) {
+            virtio_serial_send_console_resize(port, cols, rows);
+        }
+        ret = 0;
+    }
+    if (!locked) {
+        bql_unlock();
+    }
+    return ret;
+}

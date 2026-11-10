@@ -2,6 +2,7 @@
   qemu_init;
   qemu_main_loop;
   qemu_cleanup;
+  ishplus_console_resize;
   bql_lock_impl;
   bql_unlock;
   g_assertion_message_expr;
