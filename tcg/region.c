@@ -750,6 +750,69 @@ static int alloc_code_gen_buffer_splitwx_vmremap(size_t size, Error **errp)
     tcg_splitwx_diff = buf_rx - buf_rw;
     return PROT_READ | PROT_WRITE;
 }
+#if TARGET_OS_IPHONE && !TARGET_OS_SIMULATOR
+/*
+ * iOS 26+: a process cannot make its own pages executable, even while it is
+ * debugged (executing them fails with KERN_CODESIGN_ERROR). The attached
+ * debugger (a JIT enabler) must allocate them. Protocol, compatible with
+ * Madeira's JIT enabler: x16 = 1, x0 = 0, x1 = size, brk #0xf00d; the
+ * debugger returns the address of new read-execute pages in x0 (0 on failure).
+ */
+static void *ios_debugger_alloc_rx(size_t size)
+{
+    register uint64_t x0 asm("x0") = 0;
+    register uint64_t x1 asm("x1") = size;
+    register uint64_t x16 asm("x16") = 1;
+
+    asm volatile("brk #0xf00d" : "+r"(x0) : "r"(x1), "r"(x16) : "memory");
+    return (void *)x0;
+}
+
+/*
+ * The executable view comes from the debugger (or, without one, from our own
+ * read-execute mapping, which only works on older iOS); QEMU writes through a
+ * read-write alias of the same pages.
+ */
+static int alloc_code_gen_buffer_splitwx_ios(size_t size, Error **errp)
+{
+    kern_return_t ret;
+    mach_vm_address_t buf_rw = 0;
+    vm_prot_t cur_prot, max_prot;
+    void *buf_rx = NULL;
+
+    if (is_debugger_attached()) {
+        buf_rx = ios_debugger_alloc_rx(size);
+        if (buf_rx == NULL) {
+            error_report("JIT: the debugger did not allocate executable memory");
+        }
+    }
+    if (buf_rx == NULL) {
+        buf_rx = mmap(NULL, size, PROT_READ | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (buf_rx == MAP_FAILED) {
+            error_setg_errno(errp, errno, "allocate %zu bytes for jit buffer", size);
+            return -1;
+        }
+    }
+
+    ret = mach_vm_remap(mach_task_self(), &buf_rw, size, 0, VM_FLAGS_ANYWHERE,
+                        mach_task_self(), (mach_vm_address_t)buf_rx, false,
+                        &cur_prot, &max_prot, VM_INHERIT_NONE);
+    if (ret != KERN_SUCCESS) {
+        error_setg(errp, "vm_remap for jit splitwx failed (%d)", ret);
+        return -1;
+    }
+    if (mprotect((void *)buf_rw, size, PROT_READ | PROT_WRITE) != 0) {
+        error_setg_errno(errp, errno, "mprotect for jit splitwx (rw)");
+        munmap((void *)buf_rw, size);
+        return -1;
+    }
+
+    region.start_aligned = (void *)buf_rw;
+    region.total_size = size;
+    tcg_splitwx_diff = buf_rx - (void *)buf_rw;
+    return PROT_READ | PROT_WRITE;
+}
+#endif
 #endif /* CONFIG_DARWIN */
 #endif /* CONFIG_TCG_INTERPRETER */
 
@@ -757,7 +820,11 @@ static int alloc_code_gen_buffer_splitwx(size_t size, Error **errp)
 {
 #if !defined(CONFIG_TCG_INTERPRETER) && !defined(CONFIG_TCG_THREADED_INTERPRETER)
 # ifdef CONFIG_DARWIN
+#  if TARGET_OS_IPHONE && !TARGET_OS_SIMULATOR
+    return alloc_code_gen_buffer_splitwx_ios(size, errp);
+#  else
     return alloc_code_gen_buffer_splitwx_vmremap(size, errp);
+#  endif
 # endif
 # ifdef CONFIG_POSIX
     return alloc_code_gen_buffer_splitwx_memfd(size, errp);
