@@ -145,6 +145,27 @@ static FILE *local_fopenat(int dirfd, const char *name, const char *mode)
 }
 
 #define ATTR_MAX 100
+/*
+ * iSH+: in mapped mode, files made outside the guest (e.g. from the Files
+ * app) have no virtfs attributes and would appear owned by the host user;
+ * show them as owned by the guest's user instead, which the app sets with
+ * ishplus_9p_set_owner once the guest has reported it.
+ */
+static volatile int ishplus_share_uid = -1, ishplus_share_gid = -1;
+
+__attribute__((visibility("default")))
+void ishplus_9p_set_owner(int uid, int gid)
+{
+    ishplus_share_uid = uid;
+    ishplus_share_gid = gid;
+}
+
+static unsigned int ishplus_default_owner(const char *which, unsigned int host)
+{
+    int value = which[0] == 'u' ? ishplus_share_uid : ishplus_share_gid;
+    return value >= 0 ? (unsigned int)value : host;
+}
+
 static void local_mapped_file_attr(int dirfd, const char *name,
                                    struct stat *stbuf)
 {
@@ -208,10 +229,14 @@ static int local_lstat(FsContext *fs_ctx, V9fsPath *fs_path, struct stat *stbuf)
         if (fgetxattrat_nofollow(dirfd, name, "user.virtfs.uid", &tmp_uid,
                                  sizeof(uid_t)) > 0) {
             stbuf->st_uid = le32_to_cpu(tmp_uid);
+        } else {
+            stbuf->st_uid = ishplus_default_owner("uid", stbuf->st_uid);
         }
         if (fgetxattrat_nofollow(dirfd, name, "user.virtfs.gid", &tmp_gid,
                                  sizeof(gid_t)) > 0) {
             stbuf->st_gid = le32_to_cpu(tmp_gid);
+        } else {
+            stbuf->st_gid = ishplus_default_owner("gid", stbuf->st_gid);
         }
         if (fgetxattrat_nofollow(dirfd, name, "user.virtfs.mode", &tmp_mode,
                                  sizeof(mode_t)) > 0) {
@@ -797,10 +822,14 @@ static int local_fstat(FsContext *fs_ctx, int fid_type,
         if (qemu_fgetxattr(fd, "user.virtfs.uid",
                            &tmp_uid, sizeof(uid_t)) > 0) {
             stbuf->st_uid = le32_to_cpu(tmp_uid);
+        } else {
+            stbuf->st_uid = ishplus_default_owner("uid", stbuf->st_uid);
         }
         if (qemu_fgetxattr(fd, "user.virtfs.gid",
                            &tmp_gid, sizeof(gid_t)) > 0) {
             stbuf->st_gid = le32_to_cpu(tmp_gid);
+        } else {
+            stbuf->st_gid = ishplus_default_owner("gid", stbuf->st_gid);
         }
         if (qemu_fgetxattr(fd, "user.virtfs.mode",
                            &tmp_mode, sizeof(mode_t)) > 0) {
