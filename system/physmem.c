@@ -3857,6 +3857,17 @@ int ram_block_discard_range(RAMBlock *rb, uint64_t start, size_t length)
 #if defined(CONFIG_MADVISE)
             if (qemu_ram_is_shared(rb) && rb->fd < 0) {
                 ret = madvise(host_startaddr, length, QEMU_MADV_REMOVE);
+#ifdef __APPLE__
+            } else if (rb->fd < 0) {
+                /*
+                 * iSH+: on Apple systems MADV_DONTNEED does not free the
+                 * pages (the app's memory footprint, which iOS ends apps
+                 * for, stays); a fresh anonymous mapping in their place
+                 * does, and reads back as zeros, as discarded RAM must.
+                 */
+                ret = mmap(host_startaddr, length, PROT_READ | PROT_WRITE,
+                           MAP_FIXED | MAP_PRIVATE | MAP_ANON, -1, 0) == MAP_FAILED ? -1 : 0;
+#endif
             } else {
                 ret = madvise(host_startaddr, length, QEMU_MADV_DONTNEED);
             }
