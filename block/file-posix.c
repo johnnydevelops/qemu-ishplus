@@ -2247,11 +2247,21 @@ static int handle_aiocb_discard(void *opaque)
                            aiocb->aio_offset, aiocb->aio_nbytes);
         ret = translate_err(ret);
 #elif defined(__APPLE__) && (__MACH__)
+        /*
+         * iSH+: APFS only punches whole blocks (EINVAL otherwise, which the
+         * guest sees as an I/O error). Discarding is advisory: punch the
+         * whole 4 KiB blocks in the range and skip the partial ones.
+         */
+        uint64_t start = ROUND_UP(aiocb->aio_offset, 4096);
+        uint64_t end = ROUND_DOWN(aiocb->aio_offset + aiocb->aio_nbytes, 4096);
         fpunchhole_t fpunchhole;
+        if (end <= start) {
+            return 0;
+        }
         fpunchhole.fp_flags = 0;
         fpunchhole.reserved = 0;
-        fpunchhole.fp_offset = aiocb->aio_offset;
-        fpunchhole.fp_length = aiocb->aio_nbytes;
+        fpunchhole.fp_offset = start;
+        fpunchhole.fp_length = end - start;
         if (fcntl(s->fd, F_PUNCHHOLE, &fpunchhole) == -1) {
             ret = errno == ENODEV ? -ENOTSUP : -errno;
         } else {
