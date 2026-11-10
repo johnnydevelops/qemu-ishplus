@@ -11,6 +11,9 @@
  *
  */
 #include "qemu/osdep.h"
+#ifdef __APPLE__
+#include <pthread/qos.h>
+#endif
 #include "qemu/thread.h"
 #include "qemu/atomic.h"
 #include "qemu/notify.h"
@@ -563,6 +566,16 @@ void qemu_thread_create(QemuThread *thread, const char *name,
     if (mode == QEMU_THREAD_DETACHED) {
         pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
     }
+
+#ifdef __APPLE__
+    /*
+     * iSH+: vCPU threads at the highest QoS, so iOS schedules them on the
+     * performance cores; other threads inherit their creator's QoS.
+     */
+    if (name && g_str_has_prefix(name, "CPU ")) {
+        pthread_attr_set_qos_class_np(&attr, QOS_CLASS_USER_INTERACTIVE, 0);
+    }
+#endif
 
     /* Leave signal handling to the iothread.  */
     sigfillset(&set);
