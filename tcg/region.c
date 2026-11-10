@@ -627,6 +627,7 @@ extern kern_return_t mach_vm_remap(vm_map_t target_task,
 #if TARGET_OS_IPHONE && !TARGET_OS_SIMULATOR
 #include <sys/types.h>
 #include <sys/sysctl.h>
+#include <mach/machine.h>
 static int is_debugger_attached(void)
 {
     int mib[4];
@@ -649,6 +650,30 @@ static int is_debugger_attached(void)
 
     /* P_TRACED means the process is being debugged */
     return (info.kp_proc.p_flag & P_TRACED) != 0;
+}
+
+/*
+ * Only chips with TXM (A15/M2 and later) need the JIT enabler to prepare the
+ * region; on older ones a debugger that stays attached (a JIT enabler, or
+ * Xcode) would just stop the app at the breakpoint below.
+ */
+static bool device_has_txm(void)
+{
+    uint32_t family = 0;
+    size_t size = sizeof(family);
+
+    if (sysctlbyname("hw.cpufamily", &family, &size, NULL, 0) != 0) {
+        return true;
+    }
+    switch (family) {
+    /* iOS 26 runs on A12 and later; these predate TXM */
+    case CPUFAMILY_ARM_VORTEX_TEMPEST:      /* A12 */
+    case CPUFAMILY_ARM_LIGHTNING_THUNDER:   /* A13 */
+    case CPUFAMILY_ARM_FIRESTORM_ICESTORM:  /* A14, M1 */
+        return false;
+    default:
+        return true;
+    }
 }
 
 static void break_prepare_jit_region(mach_vm_address_t addr, size_t len)
@@ -707,7 +732,7 @@ static int alloc_code_gen_buffer_splitwx_vmremap(size_t size, Error **errp)
 
 #if TARGET_OS_IPHONE && !TARGET_OS_SIMULATOR
     if (__builtin_available(iOS 26, visionOS 26, watchOS 26, tvOS 26, *)) {
-        if (is_debugger_attached()) {
+        if (is_debugger_attached() && device_has_txm()) {
             /* let debugger modify the page permission */
             break_prepare_jit_region(buf_rx, size);
         }
