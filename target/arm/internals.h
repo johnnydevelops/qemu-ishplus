@@ -1993,6 +1993,8 @@ void arm_set_default_fp_behaviours(float_status *s);
 void arm_set_ah_fp_behaviours(float_status *s);
 /* Read the float_status info and return the appropriate FPSR value */
 uint32_t vfp_get_fpsr_from_host(CPUARMState *env);
+/* iSH+: fold flags of floating point run natively (vCPU thread only) */
+void arm_native_fp_sync(CPUARMState *env);
 /* Clear the exception status flags from all float_status fields */
 void vfp_clear_float_status_exc_flags(CPUARMState *env);
 /*

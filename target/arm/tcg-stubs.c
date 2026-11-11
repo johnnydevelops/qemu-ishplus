@@ -45,6 +45,10 @@ uint32_t vfp_get_fpsr_from_host(CPUARMState *env)
     return 0;
 }
 
+void arm_native_fp_sync(CPUARMState *env)
+{
+}
+
 void vfp_clear_float_status_exc_flags(CPUARMState *env)
 {
 }

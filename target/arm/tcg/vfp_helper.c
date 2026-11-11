@@ -23,6 +23,8 @@
 #include "internals.h"
 #include "cpu-features.h"
 #include "fpu/softfloat.h"
+#include "native-fp.h"
+#include "hw/core/cpu.h"
 #include "qemu/log.h"
 
 /*
@@ -105,9 +107,33 @@ static inline uint32_t vfp_exceptbits_from_host(int host_bits, bool ah)
     return target_bits;
 }
 
+#ifdef ARM_NATIVE_FP
+/*
+ * iSH+: fold the flags of floating point run on the host's FPU (they collect
+ * in this thread's FPSR) into the A64 float status. Only the vCPU's own
+ * thread has them.
+ */
+void arm_native_fp_sync(CPUARMState *env)
+{
+    if (current_cpu == env_cpu(env)) {
+        int flags = arm_native_fp_take_flags();
+
+        if (flags) {
+            float_raise(flags, &env->vfp.fp_status[FPST_A64]);
+        }
+    }
+}
+#else
+void arm_native_fp_sync(CPUARMState *env)
+{
+}
+#endif
+
 uint32_t vfp_get_fpsr_from_host(CPUARMState *env)
 {
     uint32_t a32_flags = 0, a64_flags = 0;
+
+    arm_native_fp_sync(env);
 
     a32_flags |= get_float_exception_flags(&env->vfp.fp_status[FPST_A32]);
     a32_flags |= get_float_exception_flags(&env->vfp.fp_status[FPST_STD]);
@@ -147,6 +173,11 @@ void vfp_clear_float_status_exc_flags(CPUARMState *env)
      * values. The caller should have arranged for env->vfp.fpsr to
      * be the architecturally up-to-date exception flag information first.
      */
+#ifdef ARM_NATIVE_FP
+    if (current_cpu == env_cpu(env)) {
+        arm_native_fp_clear_flags();
+    }
+#endif
     set_float_exception_flags(0, &env->vfp.fp_status[FPST_A32]);
     set_float_exception_flags(0, &env->vfp.fp_status[FPST_A64]);
     set_float_exception_flags(0, &env->vfp.fp_status[FPST_A32_F16]);
@@ -261,6 +292,31 @@ void vfp_set_fpcr_to_host(CPUARMState *env, uint32_t val, uint32_t mask)
 
 #define VFP_HELPER(name, p) HELPER(glue(glue(vfp_,name),p))
 
+/* iSH+: add, sub, mul and div on the host's FPU when allowed (native-fp.h) */
+#ifdef ARM_NATIVE_FP
+#define VFP_BINOP_NATIVE(name) \
+dh_ctype_f16 VFP_HELPER(name, h)(dh_ctype_f16 a, dh_ctype_f16 b, float_status *fpst) \
+{ \
+    return float16_ ## name(a, b, fpst); \
+} \
+float32 VFP_HELPER(name, s)(float32 a, float32 b, float_status *fpst) \
+{ \
+    if (arm_native_fp_ok(fpst)) { \
+        return native_ ## name ## s(a, b); \
+    } \
+    return float32_ ## name(a, b, fpst); \
+} \
+float64 VFP_HELPER(name, d)(float64 a, float64 b, float_status *fpst) \
+{ \
+    if (arm_native_fp_ok(fpst)) { \
+        return native_ ## name ## d(a, b); \
+    } \
+    return float64_ ## name(a, b, fpst); \
+}
+#else
+#define VFP_BINOP_NATIVE(name) VFP_BINOP(name)
+#endif
+
 #define VFP_BINOP(name) \
 dh_ctype_f16 VFP_HELPER(name, h)(dh_ctype_f16 a, dh_ctype_f16 b, float_status *fpst) \
 { \
@@ -274,10 +330,10 @@ float64 VFP_HELPER(name, d)(float64 a, float64 b, float_status *fpst) \
 { \
     return float64_ ## name(a, b, fpst); \
 }
-VFP_BINOP(add)
-VFP_BINOP(sub)
-VFP_BINOP(mul)
-VFP_BINOP(div)
+VFP_BINOP_NATIVE(add)
+VFP_BINOP_NATIVE(sub)
+VFP_BINOP_NATIVE(mul)
+VFP_BINOP_NATIVE(div)
 VFP_BINOP(min)
 VFP_BINOP(max)
 VFP_BINOP(minnum)
@@ -291,11 +347,21 @@ dh_ctype_f16 VFP_HELPER(sqrt, h)(dh_ctype_f16 a, float_status *fpst)
 
 float32 VFP_HELPER(sqrt, s)(float32 a, float_status *fpst)
 {
+#ifdef ARM_NATIVE_FP
+    if (arm_native_fp_ok(fpst)) {
+        return native_sqrts(a);
+    }
+#endif
     return float32_sqrt(a, fpst);
 }
 
 float64 VFP_HELPER(sqrt, d)(float64 a, float_status *fpst)
 {
+#ifdef ARM_NATIVE_FP
+    if (arm_native_fp_ok(fpst)) {
+        return native_sqrtd(a);
+    }
+#endif
     return float64_sqrt(a, fpst);
 }
 
@@ -1110,12 +1176,22 @@ dh_ctype_f16 VFP_HELPER(muladd, h)(dh_ctype_f16 a, dh_ctype_f16 b,
 float32 VFP_HELPER(muladd, s)(float32 a, float32 b, float32 c,
                               float_status *fpst)
 {
+#ifdef ARM_NATIVE_FP
+    if (arm_native_fp_ok(fpst)) {
+        return native_fmas(a, b, c);
+    }
+#endif
     return float32_muladd(a, b, c, 0, fpst);
 }
 
 float64 VFP_HELPER(muladd, d)(float64 a, float64 b, float64 c,
                               float_status *fpst)
 {
+#ifdef ARM_NATIVE_FP
+    if (arm_native_fp_ok(fpst)) {
+        return native_fmad(a, b, c);
+    }
+#endif
     return float64_muladd(a, b, c, 0, fpst);
 }
 

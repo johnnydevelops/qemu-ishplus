@@ -25,6 +25,7 @@
 #include "qemu/int128.h"
 #include "crypto/clmul.h"
 #include "vec_internal.h"
+#include "native-fp.h"
 
 /*
  * Data for expanding active predicate bits to bytes, for byte elements.
@@ -1416,17 +1417,40 @@ void HELPER(NAME)(void *vd, void *vn, void *vm,                            \
     clear_tail(d, oprsz, simd_maxsz(desc));                                \
 }
 
+/* iSH+: with the host's FPU where the float status allows (native-fp.h) */
+#ifdef ARM_NATIVE_FP
+#define DO_3OP_NATIVE(NAME, FUNC, NATIVE, TYPE) \
+void HELPER(NAME)(void *vd, void *vn, void *vm,                            \
+                  float_status *stat, uint32_t desc)                       \
+{                                                                          \
+    intptr_t i, oprsz = simd_oprsz(desc);                                  \
+    TYPE *d = vd, *n = vn, *m = vm;                                        \
+    if (arm_native_fp_ok(stat)) {                                          \
+        for (i = 0; i < oprsz / sizeof(TYPE); i++) {                       \
+            d[i] = NATIVE(n[i], m[i]);                                     \
+        }                                                                  \
+    } else {                                                               \
+        for (i = 0; i < oprsz / sizeof(TYPE); i++) {                       \
+            d[i] = FUNC(n[i], m[i], stat);                                 \
+        }                                                                  \
+    }                                                                      \
+    clear_tail(d, oprsz, simd_maxsz(desc));                                \
+}
+#else
+#define DO_3OP_NATIVE(NAME, FUNC, NATIVE, TYPE) DO_3OP(NAME, FUNC, TYPE)
+#endif
+
 DO_3OP(gvec_fadd_h, float16_add, float16)
-DO_3OP(gvec_fadd_s, float32_add, float32)
-DO_3OP(gvec_fadd_d, float64_add, float64)
+DO_3OP_NATIVE(gvec_fadd_s, float32_add, native_adds, float32)
+DO_3OP_NATIVE(gvec_fadd_d, float64_add, native_addd, float64)
 
 DO_3OP(gvec_fsub_h, float16_sub, float16)
-DO_3OP(gvec_fsub_s, float32_sub, float32)
-DO_3OP(gvec_fsub_d, float64_sub, float64)
+DO_3OP_NATIVE(gvec_fsub_s, float32_sub, native_subs, float32)
+DO_3OP_NATIVE(gvec_fsub_d, float64_sub, native_subd, float64)
 
 DO_3OP(gvec_fmul_h, float16_mul, float16)
-DO_3OP(gvec_fmul_s, float32_mul, float32)
-DO_3OP(gvec_fmul_d, float64_mul, float64)
+DO_3OP_NATIVE(gvec_fmul_s, float32_mul, native_muls, float32)
+DO_3OP_NATIVE(gvec_fmul_d, float64_mul, native_muld, float64)
 
 DO_3OP(gvec_ftsmul_h, float16_ftsmul, float16)
 DO_3OP(gvec_ftsmul_s, float32_ftsmul, float32)
@@ -1484,8 +1508,8 @@ DO_3OP(gvec_rsqrts_nf_s, float32_rsqrts_nf, float32)
 
 #ifdef TARGET_AARCH64
 DO_3OP(gvec_fdiv_h, float16_div, float16)
-DO_3OP(gvec_fdiv_s, float32_div, float32)
-DO_3OP(gvec_fdiv_d, float64_div, float64)
+DO_3OP_NATIVE(gvec_fdiv_s, float32_div, native_divs, float32)
+DO_3OP_NATIVE(gvec_fdiv_d, float64_div, native_divd, float64)
 
 DO_3OP(gvec_fmulx_h, helper_advsimd_mulxh, float16)
 DO_3OP(gvec_fmulx_s, helper_vfp_mulxs, float32)
@@ -1616,13 +1640,36 @@ DO_MULADD(gvec_fmla_s, float32_muladd_nf, float32)
 DO_MULADD(gvec_fmls_h, float16_mulsub_nf, float16)
 DO_MULADD(gvec_fmls_s, float32_mulsub_nf, float32)
 
+#ifdef ARM_NATIVE_FP
+/* NEG: the sign bit flipped in op1 (vfms), as float*_chs does */
+#define DO_MULADD_NATIVE(NAME, FUNC, NATIVE, NEG, TYPE)                    \
+void HELPER(NAME)(void *vd, void *vn, void *vm,                            \
+                  float_status *stat, uint32_t desc)                       \
+{                                                                          \
+    intptr_t i, oprsz = simd_oprsz(desc);                                  \
+    TYPE *d = vd, *n = vn, *m = vm;                                        \
+    if (arm_native_fp_ok(stat)) {                                          \
+        for (i = 0; i < oprsz / sizeof(TYPE); i++) {                       \
+            d[i] = NATIVE(n[i] ^ NEG, m[i], d[i]);                         \
+        }                                                                  \
+    } else {                                                               \
+        for (i = 0; i < oprsz / sizeof(TYPE); i++) {                       \
+            d[i] = FUNC(d[i], n[i], m[i], stat);                           \
+        }                                                                  \
+    }                                                                      \
+    clear_tail(d, oprsz, simd_maxsz(desc));                                \
+}
+#else
+#define DO_MULADD_NATIVE(NAME, FUNC, NATIVE, NEG, TYPE) DO_MULADD(NAME, FUNC, TYPE)
+#endif
+
 DO_MULADD(gvec_vfma_h, float16_muladd_f, float16)
-DO_MULADD(gvec_vfma_s, float32_muladd_f, float32)
-DO_MULADD(gvec_vfma_d, float64_muladd_f, float64)
+DO_MULADD_NATIVE(gvec_vfma_s, float32_muladd_f, native_fmas, 0, float32)
+DO_MULADD_NATIVE(gvec_vfma_d, float64_muladd_f, native_fmad, 0, float64)
 
 DO_MULADD(gvec_vfms_h, float16_mulsub_f, float16)
-DO_MULADD(gvec_vfms_s, float32_mulsub_f, float32)
-DO_MULADD(gvec_vfms_d, float64_mulsub_f, float64)
+DO_MULADD_NATIVE(gvec_vfms_s, float32_mulsub_f, native_fmas, INT32_MIN, float32)
+DO_MULADD_NATIVE(gvec_vfms_d, float64_mulsub_f, native_fmad, INT64_MIN, float64)
 
 DO_MULADD(gvec_ah_vfms_h, float16_ah_mulsub_f, float16)
 DO_MULADD(gvec_ah_vfms_s, float32_ah_mulsub_f, float32)
@@ -1700,8 +1747,32 @@ void HELPER(NAME)(void *vd, void *vn, void *vm,                            \
 #define nop(N, M, S) (M)
 
 DO_FMUL_IDX(gvec_fmul_idx_h, nop, float16_mul, float16, H2)
+#ifdef ARM_NATIVE_FP
+#define DO_FMUL_IDX_NATIVE(NAME, MUL, NATIVE, TYPE, H)                     \
+void HELPER(NAME)(void *vd, void *vn, void *vm,                            \
+                  float_status *stat, uint32_t desc)                       \
+{                                                                          \
+    intptr_t i, j, oprsz = simd_oprsz(desc);                               \
+    intptr_t segment = MIN(16, oprsz) / sizeof(TYPE);                      \
+    intptr_t idx = simd_data(desc);                                        \
+    TYPE *d = vd, *n = vn, *m = vm;                                        \
+    bool native = arm_native_fp_ok(stat);                                  \
+    for (i = 0; i < oprsz / sizeof(TYPE); i += segment) {                  \
+        TYPE mm = m[H(i + idx)];                                           \
+        for (j = 0; j < segment; j++) {                                    \
+            d[i + j] = native ? NATIVE(n[i + j], mm)                       \
+                              : MUL(n[i + j], mm, stat);                   \
+        }                                                                  \
+    }                                                                      \
+    clear_tail(d, oprsz, simd_maxsz(desc));                                \
+}
+DO_FMUL_IDX_NATIVE(gvec_fmul_idx_s, float32_mul, native_muls, float32, H4)
+DO_FMUL_IDX_NATIVE(gvec_fmul_idx_d, float64_mul, native_muld, float64, H8)
+#undef DO_FMUL_IDX_NATIVE
+#else
 DO_FMUL_IDX(gvec_fmul_idx_s, nop, float32_mul, float32, H4)
 DO_FMUL_IDX(gvec_fmul_idx_d, nop, float64_mul, float64, H8)
+#endif
 
 #ifdef TARGET_AARCH64
 
@@ -1724,6 +1795,18 @@ DO_FMUL_IDX(gvec_fmls_nf_idx_s, float32_sub, float32_mul, float32, H4)
 
 #undef DO_FMUL_IDX
 
+/* iSH+: fused multiply-add by element on the host's FPU when allowed */
+#ifdef ARM_NATIVE_FP
+#define NATIVE_FP_OK(S) arm_native_fp_ok(S)
+#define NATIVE_FMA_float32 native_fmas
+#define NATIVE_FMA_float64 native_fmad
+#define NATIVE_FMA_float16(A, B, C) (A) /* never: native_ok is false */
+#else
+#define NATIVE_FP_OK(S) false
+#define NATIVE_FMA_float32(A, B, C) (A)
+#define NATIVE_FMA_float64(A, B, C) (A)
+#define NATIVE_FMA_float16(A, B, C) (A)
+#endif
 #define DO_FMLA_IDX(NAME, TYPE, H, NEGX, NEGF)                             \
 void HELPER(NAME)(void *vd, void *vn, void *vm, void *va,                  \
                   float_status *stat, uint32_t desc)                       \
@@ -1732,8 +1815,15 @@ void HELPER(NAME)(void *vd, void *vn, void *vm, void *va,                  \
     intptr_t segment = MIN(16, oprsz) / sizeof(TYPE);                      \
     intptr_t idx = simd_data(desc);                                        \
     TYPE *d = vd, *n = vn, *m = vm, *a = va;                               \
+    bool native_ok = NEGF == 0 && NATIVE_FP_OK(stat);                      \
     for (i = 0; i < oprsz / sizeof(TYPE); i += segment) {                  \
         TYPE mm = m[H(i + idx)];                                           \
+        if (native_ok) {                                                   \
+            for (j = 0; j < segment; j++) {                                \
+                d[i + j] = NATIVE_FMA_##TYPE(n[i + j] ^ NEGX, mm, a[i + j]); \
+            }                                                              \
+            continue;                                                      \
+        }                                                                  \
         for (j = 0; j < segment; j++) {                                    \
             d[i + j] = TYPE##_muladd(n[i + j] ^ NEGX, mm,                  \
                                      a[i + j], NEGF, stat);                \

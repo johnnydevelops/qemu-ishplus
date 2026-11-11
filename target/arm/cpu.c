@@ -2682,7 +2682,14 @@ static const struct SysemuCPUOps arm_sysemu_ops = {
 #endif
 
 #ifdef CONFIG_TCG
+/* iSH+: natively computed FP flags, folded in for other threads to see */
+static void arm_cpu_exec_exit(CPUState *cs)
+{
+    arm_native_fp_sync(cpu_env(cs));
+}
+
 static const TCGCPUOps arm_tcg_ops = {
+    .cpu_exec_exit = arm_cpu_exec_exit,
     .initialize = arm_translate_init,
     .translate_code = arm_translate_code,
     .synchronize_from_tb = arm_cpu_synchronize_from_tb,
