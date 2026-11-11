@@ -334,10 +334,10 @@ VFP_BINOP_NATIVE(add)
 VFP_BINOP_NATIVE(sub)
 VFP_BINOP_NATIVE(mul)
 VFP_BINOP_NATIVE(div)
-VFP_BINOP(min)
-VFP_BINOP(max)
-VFP_BINOP(minnum)
-VFP_BINOP(maxnum)
+VFP_BINOP_NATIVE(min)
+VFP_BINOP_NATIVE(max)
+VFP_BINOP_NATIVE(minnum)
+VFP_BINOP_NATIVE(maxnum)
 #undef VFP_BINOP
 
 dh_ctype_f16 VFP_HELPER(sqrt, h)(dh_ctype_f16 a, float_status *fpst)
@@ -441,11 +441,21 @@ FLOAT_CONVS(ui, d, float64, 64, u)
 /* floating point conversion */
 float64 VFP_HELPER(fcvtd, s)(float32 x, float_status *status)
 {
+#ifdef ARM_NATIVE_FP
+    if (arm_native_fp_ok(status)) {
+        return native_fcvtds(x);
+    }
+#endif
     return float32_to_float64(x, status);
 }
 
 float32 VFP_HELPER(fcvts, d)(float64 x, float_status *status)
 {
+#ifdef ARM_NATIVE_FP
+    if (arm_native_fp_ok(status)) {
+        return native_fcvtsd(x);
+    }
+#endif
     return float64_to_float32(x, status);
 }
 
@@ -468,10 +478,53 @@ uint32_t HELPER(bfcvt_pair)(uint64_t pair, float_status *status)
  * round-to-nearest so either helper will work.) AArch32 float-to-fix
  * must round-to-zero.
  */
+/*
+ * iSH+: integer <-> float without a fixed-point shift on the host's FPU
+ * (native-fp.h); the 16-bit integer forms have no native version.
+ */
+#ifdef ARM_NATIVE_FP
+#define NATIVE_ITOF_TRY(name, ftype, itype)                                  \
+static inline bool native_try_##name(itype x, ftype *out)                    \
+{ *out = native_##name(x); return true; }
+#define NATIVE_ITOF_NONE(name, ftype, itype)                                 \
+static inline bool native_try_##name(itype x, ftype *out) { return false; }
+NATIVE_ITOF_TRY(sltod, float64, int32_t) NATIVE_ITOF_TRY(ultod, float64, uint32_t)
+NATIVE_ITOF_TRY(sqtod, float64, int64_t) NATIVE_ITOF_TRY(uqtod, float64, uint64_t)
+NATIVE_ITOF_TRY(sltos, float32, int32_t) NATIVE_ITOF_TRY(ultos, float32, uint32_t)
+NATIVE_ITOF_TRY(sqtos, float32, int64_t) NATIVE_ITOF_TRY(uqtos, float32, uint64_t)
+NATIVE_ITOF_NONE(shtod, float64, int16_t) NATIVE_ITOF_NONE(uhtod, float64, uint16_t)
+NATIVE_ITOF_NONE(shtos, float32, int16_t) NATIVE_ITOF_NONE(uhtos, float32, uint16_t)
+#define NATIVE_FTOI_NONE(name, ftype, itype)                                 \
+static inline bool native_##name(ftype a, FloatRoundMode r, itype *out) { return false; }
+NATIVE_FTOI_NONE(toshd, float64, int16_t) NATIVE_FTOI_NONE(touhd, float64, uint16_t)
+NATIVE_FTOI_NONE(toshs, float32, int16_t) NATIVE_FTOI_NONE(touhs, float32, uint16_t)
+/* half precision: none */
+NATIVE_ITOF_NONE(shtoh, dh_ctype_f16, int16_t) NATIVE_ITOF_NONE(uhtoh, dh_ctype_f16, uint16_t)
+NATIVE_ITOF_NONE(sltoh, dh_ctype_f16, int32_t) NATIVE_ITOF_NONE(ultoh, dh_ctype_f16, uint32_t)
+NATIVE_ITOF_NONE(sqtoh, dh_ctype_f16, int64_t) NATIVE_ITOF_NONE(uqtoh, dh_ctype_f16, uint64_t)
+NATIVE_FTOI_NONE(toshh, dh_ctype_f16, int16_t) NATIVE_FTOI_NONE(touhh, dh_ctype_f16, uint16_t)
+NATIVE_FTOI_NONE(toslh, dh_ctype_f16, int32_t) NATIVE_FTOI_NONE(toulh, dh_ctype_f16, uint32_t)
+NATIVE_FTOI_NONE(tosqh, dh_ctype_f16, int64_t) NATIVE_FTOI_NONE(touqh, dh_ctype_f16, uint64_t)
+#endif
+
+#ifdef ARM_NATIVE_FP
+#define VFP_CONV_FIX_FLOAT(name, p, fsz, ftype, isz, itype)            \
+ftype HELPER(vfp_##name##to##p)(uint##isz##_t  x, uint32_t shift,      \
+                                float_status *fpst)                    \
+{                                                                      \
+    ftype r;                                                           \
+    if (shift == 0 && arm_native_fp_ok(fpst) &&                        \
+        native_try_##name##to##p((itype##_t)x, &r)) {                  \
+        return r;                                                      \
+    }                                                                  \
+    return itype##_to_##float##fsz##_scalbn(x, -shift, fpst);          \
+}
+#else
 #define VFP_CONV_FIX_FLOAT(name, p, fsz, ftype, isz, itype)            \
 ftype HELPER(vfp_##name##to##p)(uint##isz##_t  x, uint32_t shift,      \
                                 float_status *fpst)                    \
 { return itype##_to_##float##fsz##_scalbn(x, -shift, fpst); }
+#endif
 
 #define VFP_CONV_FIX_FLOAT_ROUND(name, p, fsz, ftype, isz, itype)      \
     ftype HELPER(vfp_##name##to##p##_round_to_nearest)(uint##isz##_t  x, \
@@ -486,10 +539,23 @@ ftype HELPER(vfp_##name##to##p)(uint##isz##_t  x, uint32_t shift,      \
         return ret;                                                    \
     }
 
+#ifdef ARM_NATIVE_FP
+#define VFP_FTOI_NATIVE(name, p, itype, ROUND)                               \
+    {                                                                     \
+        itype##_t r;                                                      \
+        if (shift == 0 && arm_native_fp_ok_anyround(fpst) &&              \
+            native_to##name##p(x, ROUND, &r)) {                           \
+            return r;                                                     \
+        }                                                                 \
+    }
+#else
+#define VFP_FTOI_NATIVE(name, p, itype, ROUND)
+#endif
 #define VFP_CONV_FLOAT_FIX_ROUND(name, p, fsz, ftype, isz, itype, ROUND, suff) \
 uint##isz##_t HELPER(vfp_to##name##p##suff)(ftype x, uint32_t shift,      \
                                             float_status *fpst)           \
 {                                                                         \
+    VFP_FTOI_NATIVE(name, p, itype, ROUND)                                \
     if (unlikely(float##fsz##_is_any_nan(x))) {                           \
         float_raise(float_flag_invalid, fpst);                            \
         return 0;                                                         \

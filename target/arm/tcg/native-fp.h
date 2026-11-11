@@ -121,6 +121,27 @@ NATIVE_BINOP(addd, "fadd", float64, "d", double)
 NATIVE_BINOP(subd, "fsub", float64, "d", double)
 NATIVE_BINOP(muld, "fmul", float64, "d", double)
 NATIVE_BINOP(divd, "fdiv", float64, "d", double)
+/* min/max, absolute difference and compares (masks), FPCR.AH = 0 forms */
+NATIVE_BINOP(maxs, "fmax", float32, "s", float)
+NATIVE_BINOP(mins, "fmin", float32, "s", float)
+NATIVE_BINOP(maxnums, "fmaxnm", float32, "s", float)
+NATIVE_BINOP(minnums, "fminnm", float32, "s", float)
+NATIVE_BINOP(maxd, "fmax", float64, "d", double)
+NATIVE_BINOP(mind, "fmin", float64, "d", double)
+NATIVE_BINOP(maxnumd, "fmaxnm", float64, "d", double)
+NATIVE_BINOP(minnumd, "fminnm", float64, "d", double)
+NATIVE_BINOP(abds, "fabd", float32, "s", float)
+NATIVE_BINOP(abdd, "fabd", float64, "d", double)
+NATIVE_BINOP(ceqs, "fcmeq", float32, "s", float)
+NATIVE_BINOP(cges, "fcmge", float32, "s", float)
+NATIVE_BINOP(cgts, "fcmgt", float32, "s", float)
+NATIVE_BINOP(acges, "facge", float32, "s", float)
+NATIVE_BINOP(acgts, "facgt", float32, "s", float)
+NATIVE_BINOP(ceqd, "fcmeq", float64, "d", double)
+NATIVE_BINOP(cged, "fcmge", float64, "d", double)
+NATIVE_BINOP(cgtd, "fcmgt", float64, "d", double)
+NATIVE_BINOP(acged, "facge", float64, "d", double)
+NATIVE_BINOP(acgtd, "facgt", float64, "d", double)
 #undef NATIVE_BINOP
 
 #define NATIVE_SQRT(NAME, TYPE, REG, CT)                                    \
@@ -156,6 +177,114 @@ static inline TYPE native_##NAME(TYPE a, TYPE b, TYPE c)                    \
 NATIVE_FMA(fmas, float32, "s", float)
 NATIVE_FMA(fmad, float64, "d", double)
 #undef NATIVE_FMA
+
+/*
+ * As arm_native_fp_ok(), but any rounding mode: for float to integer
+ * conversions, whose host instruction names the rounding.
+ */
+static inline bool arm_native_fp_ok_anyround(float_status *s)
+{
+    float_status t = *s;
+
+    t.float_rounding_mode = float_round_nearest_even;
+    return arm_native_fp_ok(&t);
+}
+
+/* FCMP/FCMPE: NZCV as PSTATE bits */
+#define NATIVE_FCMP(NAME, INSN, TYPE, REG, CT)                              \
+static inline uint64_t native_##NAME(TYPE a, TYPE b)                        \
+{                                                                           \
+    CT x, y;                                                                \
+    uint64_t nzcv;                                                          \
+    memcpy(&x, &a, sizeof(x));                                              \
+    memcpy(&y, &b, sizeof(y));                                              \
+    asm volatile(INSN " %" REG "1, %" REG "2\n mrs %0, nzcv"                \
+                 : "=r"(nzcv) : "w"(x), "w"(y) : "cc");                     \
+    return nzcv;                                                            \
+}
+NATIVE_FCMP(cmps, "fcmp", float32, "s", float)
+NATIVE_FCMP(cmpes, "fcmpe", float32, "s", float)
+NATIVE_FCMP(cmpd, "fcmp", float64, "d", double)
+NATIVE_FCMP(cmped, "fcmpe", float64, "d", double)
+#undef NATIVE_FCMP
+
+static inline float64 native_fcvtds(float32 a)
+{
+    float x; double r; float64 out;
+    memcpy(&x, &a, 4);
+    asm volatile("fcvt %d0, %s1" : "=w"(r) : "w"(x));
+    memcpy(&out, &r, 8);
+    return out;
+}
+
+static inline float32 native_fcvtsd(float64 a)
+{
+    double x; float r; float32 out;
+    memcpy(&x, &a, 8);
+    asm volatile("fcvt %s0, %d1" : "=w"(r) : "w"(x));
+    memcpy(&out, &r, 4);
+    return out;
+}
+
+/* Integer to float (the FPCR's rounding: nearest even here) */
+#define NATIVE_ITOF(NAME, INSN, ITYPE, IREG, FTYPE, FREG, CT)                \
+static inline FTYPE native_##NAME(ITYPE a)                                  \
+{                                                                           \
+    CT r; FTYPE out;                                                        \
+    asm volatile(INSN " %" FREG "0, %" IREG "1" : "=w"(r) : "r"(a));         \
+    memcpy(&out, &r, sizeof(out));                                          \
+    return out;                                                             \
+}
+NATIVE_ITOF(sltod, "scvtf", int32_t, "w", float64, "d", double)
+NATIVE_ITOF(ultod, "ucvtf", uint32_t, "w", float64, "d", double)
+NATIVE_ITOF(sqtod, "scvtf", int64_t, "x", float64, "d", double)
+NATIVE_ITOF(uqtod, "ucvtf", uint64_t, "x", float64, "d", double)
+NATIVE_ITOF(sltos, "scvtf", int32_t, "w", float32, "s", float)
+NATIVE_ITOF(ultos, "ucvtf", uint32_t, "w", float32, "s", float)
+NATIVE_ITOF(sqtos, "scvtf", int64_t, "x", float32, "s", float)
+NATIVE_ITOF(uqtos, "ucvtf", uint64_t, "x", float32, "s", float)
+#undef NATIVE_ITOF
+
+/*
+ * Float to integer with a rounding mode: the instruction for it, or false
+ * (then softfloat) for modes without one.
+ */
+#define NATIVE_FTOI(NAME, SIGN, ITYPE, IREG, FTYPE, FREG, CT)                \
+static inline bool native_##NAME(FTYPE a, FloatRoundMode rmode, ITYPE *out)  \
+{                                                                           \
+    CT x; ITYPE r;                                                          \
+    memcpy(&x, &a, sizeof(x));                                              \
+    switch (rmode) {                                                        \
+    case float_round_nearest_even:                                          \
+        asm volatile("fcvtn" SIGN " %" IREG "0, %" FREG "1" : "=r"(r) : "w"(x)); \
+        break;                                                              \
+    case float_round_to_zero:                                               \
+        asm volatile("fcvtz" SIGN " %" IREG "0, %" FREG "1" : "=r"(r) : "w"(x)); \
+        break;                                                              \
+    case float_round_up:                                                    \
+        asm volatile("fcvtp" SIGN " %" IREG "0, %" FREG "1" : "=r"(r) : "w"(x)); \
+        break;                                                              \
+    case float_round_down:                                                  \
+        asm volatile("fcvtm" SIGN " %" IREG "0, %" FREG "1" : "=r"(r) : "w"(x)); \
+        break;                                                              \
+    case float_round_ties_away:                                             \
+        asm volatile("fcvta" SIGN " %" IREG "0, %" FREG "1" : "=r"(r) : "w"(x)); \
+        break;                                                              \
+    default:                                                                \
+        return false;                                                       \
+    }                                                                       \
+    *out = r;                                                               \
+    return true;                                                            \
+}
+NATIVE_FTOI(tosld, "s", int32_t, "w", float64, "d", double)
+NATIVE_FTOI(tould, "u", uint32_t, "w", float64, "d", double)
+NATIVE_FTOI(tosqd, "s", int64_t, "x", float64, "d", double)
+NATIVE_FTOI(touqd, "u", uint64_t, "x", float64, "d", double)
+NATIVE_FTOI(tosls, "s", int32_t, "w", float32, "s", float)
+NATIVE_FTOI(touls, "u", uint32_t, "w", float32, "s", float)
+NATIVE_FTOI(tosqs, "s", int64_t, "x", float32, "s", float)
+NATIVE_FTOI(touqs, "u", uint64_t, "x", float32, "s", float)
+#undef NATIVE_FTOI
 
 #endif /* __aarch64__ */
 

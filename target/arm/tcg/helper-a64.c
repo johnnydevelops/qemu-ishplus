@@ -35,6 +35,7 @@
 #include "qemu/atomic128.h"
 #include "fpu/softfloat.h"
 #include <zlib.h> /* for crc32 */
+#include "native-fp.h"
 #ifdef CONFIG_USER_ONLY
 #include "user/page-protection.h"
 #endif
@@ -147,21 +148,41 @@ uint64_t HELPER(vfp_cmpeh_a64)(uint32_t x, uint32_t y, float_status *fp_status)
 
 uint64_t HELPER(vfp_cmps_a64)(float32 x, float32 y, float_status *fp_status)
 {
+#ifdef ARM_NATIVE_FP
+    if (arm_native_fp_ok(fp_status)) {
+        return native_cmps(x, y);
+    }
+#endif
     return float_rel_to_flags(float32_compare_quiet(x, y, fp_status));
 }
 
 uint64_t HELPER(vfp_cmpes_a64)(float32 x, float32 y, float_status *fp_status)
 {
+#ifdef ARM_NATIVE_FP
+    if (arm_native_fp_ok(fp_status)) {
+        return native_cmpes(x, y);
+    }
+#endif
     return float_rel_to_flags(float32_compare(x, y, fp_status));
 }
 
 uint64_t HELPER(vfp_cmpd_a64)(float64 x, float64 y, float_status *fp_status)
 {
+#ifdef ARM_NATIVE_FP
+    if (arm_native_fp_ok(fp_status)) {
+        return native_cmpd(x, y);
+    }
+#endif
     return float_rel_to_flags(float64_compare_quiet(x, y, fp_status));
 }
 
 uint64_t HELPER(vfp_cmped_a64)(float64 x, float64 y, float_status *fp_status)
 {
+#ifdef ARM_NATIVE_FP
+    if (arm_native_fp_ok(fp_status)) {
+        return native_cmped(x, y);
+    }
+#endif
     return float_rel_to_flags(float64_compare(x, y, fp_status));
 }
 
