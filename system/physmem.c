@@ -1837,6 +1837,24 @@ static void dirty_memory_extend(ram_addr_t new_ram_size)
     ram_list.num_dirty_blocks = new_num_blocks;
 }
 
+#ifdef __APPLE__
+/*
+ * iSH+: guest RAM the app provides. On iOS the app can map memory that other
+ * processes allocated (its RAM donors, app extensions), which does not count
+ * toward the app's own memory limit. The provider returns memory for a RAM
+ * block (by its memory region's name), or NULL for QEMU to allocate it; the
+ * app keeps that memory mapped for as long as the process lives.
+ */
+typedef void *(*IshplusRamProvider)(const char *name, uint64_t size, uint64_t align);
+static IshplusRamProvider ishplus_ram_provider;
+
+void ishplus_ram_set_provider(IshplusRamProvider provider);
+void ishplus_ram_set_provider(IshplusRamProvider provider)
+{
+    ishplus_ram_provider = provider;
+}
+#endif
+
 static void ram_block_add(RAMBlock *new_block, Error **errp)
 {
     const bool noreserve = qemu_ram_is_noreserve(new_block);
@@ -1860,6 +1878,19 @@ static void ram_block_add(RAMBlock *new_block, Error **errp)
                 return;
             }
         } else {
+#ifdef __APPLE__
+            if (ishplus_ram_provider && !shared) {
+                uint64_t align = MAX(new_block->mr->align, QEMU_VMALLOC_ALIGN);
+
+                new_block->host = ishplus_ram_provider(memory_region_name(new_block->mr),
+                                                       new_block->max_length, align);
+                if (new_block->host) {
+                    new_block->mr->align = align;
+                    new_block->ishplus_provided = true;
+                }
+            }
+            if (!new_block->host)
+#endif
             new_block->host = qemu_anon_ram_alloc(new_block->max_length,
                                                   &new_block->mr->align,
                                                   shared, noreserve);
@@ -2243,6 +2274,10 @@ static void reclaim_ramblock(RAMBlock *block)
 {
     if (block->flags & RAM_PREALLOC) {
         ;
+#ifdef __APPLE__
+    } else if (block->ishplus_provided) {
+        ; /* the app's memory */
+#endif
     } else if (xen_enabled()) {
         xen_invalidate_map_cache_entry(block->host);
 #ifndef _WIN32
@@ -3858,6 +3893,15 @@ int ram_block_discard_range(RAMBlock *rb, uint64_t start, size_t length)
             if (qemu_ram_is_shared(rb) && rb->fd < 0) {
                 ret = madvise(host_startaddr, length, QEMU_MADV_REMOVE);
 #ifdef __APPLE__
+            } else if (rb->ishplus_provided) {
+                /*
+                 * iSH+: memory the app's donors allocated. A fresh mapping
+                 * would put it back on the app's own memory footprint;
+                 * reusable pages are freed in place instead (their contents
+                 * are undefined afterwards, which free page reporting, the
+                 * only discarder here, allows).
+                 */
+                ret = madvise(host_startaddr, length, MADV_FREE_REUSABLE);
             } else if (rb->fd < 0) {
                 /*
                  * iSH+: on Apple systems MADV_DONTNEED does not free the

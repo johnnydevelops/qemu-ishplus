@@ -34,6 +34,8 @@ struct RAMBlock {
     ram_addr_t max_length;
     void (*resized)(const char*, uint64_t length, void *host);
     uint32_t flags;
+    /* iSH+: the memory came from the app (ishplus_ram_set_provider) */
+    bool ishplus_provided;
     /* Protected by the BQL.  */
     char idstr[256];
     /* RCU-enabled, writes protected by the ramlist lock */
