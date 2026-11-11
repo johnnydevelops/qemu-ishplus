@@ -12,6 +12,9 @@
 #define CPUINFO_AES             (1u << 3)
 #define CPUINFO_PMULL           (1u << 4)
 #define CPUINFO_BTI             (1u << 5)
+/* iSH+: for running guest CRC32 and SHA-512 instructions natively */
+#define CPUINFO_CRC32           (1u << 6)
+#define CPUINFO_SHA512          (1u << 7)
 
 /* Initialized with a constructor. */
 extern unsigned cpuinfo;

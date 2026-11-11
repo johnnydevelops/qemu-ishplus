@@ -18,6 +18,20 @@
 #include "crypto/sm4.h"
 #include "vec_internal.h"
 
+/*
+ * iSH+: on an AArch64 host, the SHA instructions are the host's own (they
+ * compute exactly what the guest's do); SHA-1 and SHA-256 are in every
+ * AArch64 CPU with the crypto extension, SHA-512 is checked at run time.
+ * AES and PMULL already use the host's (crypto/aes-round.h, clmul.h).
+ */
+#if defined(__aarch64__) && defined(__ARM_FEATURE_SHA2)
+#include "host/cpuinfo.h"
+#include <arm_neon.h>
+#define NATIVE_SHA 1
+#define NATIVE_V(NAME, PTR) uint32x4_t NAME; memcpy(&NAME, (PTR), 16)
+#define NATIVE_DONE(VD, D, DESC) do { memcpy((VD), &(D), 16); clear_tail_16((VD), (DESC)); return; } while (0)
+#endif
+
 union CRYPTO_STATE {
     uint8_t    bytes[16];
     uint32_t   words[4];
@@ -168,6 +182,12 @@ static uint32_t maj(uint32_t x, uint32_t y, uint32_t z)
 
 void HELPER(crypto_sha1su0)(void *vd, void *vn, void *vm, uint32_t desc)
 {
+#ifdef NATIVE_SHA
+    { NATIVE_V(d, vd); NATIVE_V(n, vn); NATIVE_V(m, vm);
+      asm("sha1su0 %0.4s, %1.4s, %2.4s" : "+w"(d) : "w"(n), "w"(m));
+      NATIVE_DONE(vd, d, desc); }
+#endif
+
     uint64_t *d = vd, *n = vn, *m = vm;
     uint64_t d0, d1;
 
@@ -213,6 +233,12 @@ static uint32_t do_sha1c(union CRYPTO_STATE *d)
 
 void HELPER(crypto_sha1c)(void *vd, void *vn, void *vm, uint32_t desc)
 {
+#ifdef NATIVE_SHA
+    { NATIVE_V(d, vd); NATIVE_V(n, vn); NATIVE_V(m, vm);
+      asm("sha1c %q0, %s1, %2.4s" : "+w"(d) : "w"(n), "w"(m));
+      NATIVE_DONE(vd, d, desc); }
+#endif
+
     crypto_sha1_3reg(vd, vn, vm, desc, do_sha1c);
 }
 
@@ -223,6 +249,12 @@ static uint32_t do_sha1p(union CRYPTO_STATE *d)
 
 void HELPER(crypto_sha1p)(void *vd, void *vn, void *vm, uint32_t desc)
 {
+#ifdef NATIVE_SHA
+    { NATIVE_V(d, vd); NATIVE_V(n, vn); NATIVE_V(m, vm);
+      asm("sha1p %q0, %s1, %2.4s" : "+w"(d) : "w"(n), "w"(m));
+      NATIVE_DONE(vd, d, desc); }
+#endif
+
     crypto_sha1_3reg(vd, vn, vm, desc, do_sha1p);
 }
 
@@ -233,11 +265,23 @@ static uint32_t do_sha1m(union CRYPTO_STATE *d)
 
 void HELPER(crypto_sha1m)(void *vd, void *vn, void *vm, uint32_t desc)
 {
+#ifdef NATIVE_SHA
+    { NATIVE_V(d, vd); NATIVE_V(n, vn); NATIVE_V(m, vm);
+      asm("sha1m %q0, %s1, %2.4s" : "+w"(d) : "w"(n), "w"(m));
+      NATIVE_DONE(vd, d, desc); }
+#endif
+
     crypto_sha1_3reg(vd, vn, vm, desc, do_sha1m);
 }
 
 void HELPER(crypto_sha1h)(void *vd, void *vm, uint32_t desc)
 {
+#ifdef NATIVE_SHA
+    { uint32x4_t d; NATIVE_V(m, vm);
+      asm("sha1h %s0, %s1" : "=w"(d) : "w"(m));
+      NATIVE_DONE(vd, d, desc); }
+#endif
+
     uint64_t *rd = vd;
     uint64_t *rm = vm;
     union CRYPTO_STATE m = { .l = { rm[0], rm[1] } };
@@ -253,6 +297,12 @@ void HELPER(crypto_sha1h)(void *vd, void *vm, uint32_t desc)
 
 void HELPER(crypto_sha1su1)(void *vd, void *vm, uint32_t desc)
 {
+#ifdef NATIVE_SHA
+    { NATIVE_V(d, vd); NATIVE_V(m, vm);
+      asm("sha1su1 %0.4s, %1.4s" : "+w"(d) : "w"(m));
+      NATIVE_DONE(vd, d, desc); }
+#endif
+
     uint64_t *rd = vd;
     uint64_t *rm = vm;
     union CRYPTO_STATE d = { .l = { rd[0], rd[1] } };
@@ -296,6 +346,12 @@ static uint32_t s1(uint32_t x)
 
 void HELPER(crypto_sha256h)(void *vd, void *vn, void *vm, uint32_t desc)
 {
+#ifdef NATIVE_SHA
+    { NATIVE_V(d, vd); NATIVE_V(n, vn); NATIVE_V(m, vm);
+      asm("sha256h %q0, %q1, %2.4s" : "+w"(d) : "w"(n), "w"(m));
+      NATIVE_DONE(vd, d, desc); }
+#endif
+
     uint64_t *rd = vd;
     uint64_t *rn = vn;
     uint64_t *rm = vm;
@@ -331,6 +387,12 @@ void HELPER(crypto_sha256h)(void *vd, void *vn, void *vm, uint32_t desc)
 
 void HELPER(crypto_sha256h2)(void *vd, void *vn, void *vm, uint32_t desc)
 {
+#ifdef NATIVE_SHA
+    { NATIVE_V(d, vd); NATIVE_V(n, vn); NATIVE_V(m, vm);
+      asm("sha256h2 %q0, %q1, %2.4s" : "+w"(d) : "w"(n), "w"(m));
+      NATIVE_DONE(vd, d, desc); }
+#endif
+
     uint64_t *rd = vd;
     uint64_t *rn = vn;
     uint64_t *rm = vm;
@@ -358,6 +420,12 @@ void HELPER(crypto_sha256h2)(void *vd, void *vn, void *vm, uint32_t desc)
 
 void HELPER(crypto_sha256su0)(void *vd, void *vm, uint32_t desc)
 {
+#ifdef NATIVE_SHA
+    { NATIVE_V(d, vd); NATIVE_V(m, vm);
+      asm("sha256su0 %0.4s, %1.4s" : "+w"(d) : "w"(m));
+      NATIVE_DONE(vd, d, desc); }
+#endif
+
     uint64_t *rd = vd;
     uint64_t *rm = vm;
     union CRYPTO_STATE d = { .l = { rd[0], rd[1] } };
@@ -376,6 +444,12 @@ void HELPER(crypto_sha256su0)(void *vd, void *vm, uint32_t desc)
 
 void HELPER(crypto_sha256su1)(void *vd, void *vn, void *vm, uint32_t desc)
 {
+#ifdef NATIVE_SHA
+    { NATIVE_V(d, vd); NATIVE_V(n, vn); NATIVE_V(m, vm);
+      asm("sha256su1 %0.4s, %1.4s, %2.4s" : "+w"(d) : "w"(n), "w"(m));
+      NATIVE_DONE(vd, d, desc); }
+#endif
+
     uint64_t *rd = vd;
     uint64_t *rn = vn;
     uint64_t *rm = vm;
@@ -430,6 +504,14 @@ static uint64_t s1_512(uint64_t x)
 
 void HELPER(crypto_sha512h)(void *vd, void *vn, void *vm, uint32_t desc)
 {
+#ifdef NATIVE_SHA
+    if (cpuinfo & CPUINFO_SHA512) {
+        NATIVE_V(d, vd); NATIVE_V(n, vn); NATIVE_V(m, vm);
+        asm(".arch_extension sha3\n sha512h %q0, %q1, %2.2d" : "+w"(d) : "w"(n), "w"(m));
+        NATIVE_DONE(vd, d, desc);
+    }
+#endif
+
     uint64_t *rd = vd;
     uint64_t *rn = vn;
     uint64_t *rm = vm;
@@ -447,6 +529,14 @@ void HELPER(crypto_sha512h)(void *vd, void *vn, void *vm, uint32_t desc)
 
 void HELPER(crypto_sha512h2)(void *vd, void *vn, void *vm, uint32_t desc)
 {
+#ifdef NATIVE_SHA
+    if (cpuinfo & CPUINFO_SHA512) {
+        NATIVE_V(d, vd); NATIVE_V(n, vn); NATIVE_V(m, vm);
+        asm(".arch_extension sha3\n sha512h2 %q0, %q1, %2.2d" : "+w"(d) : "w"(n), "w"(m));
+        NATIVE_DONE(vd, d, desc);
+    }
+#endif
+
     uint64_t *rd = vd;
     uint64_t *rn = vn;
     uint64_t *rm = vm;
@@ -464,6 +554,14 @@ void HELPER(crypto_sha512h2)(void *vd, void *vn, void *vm, uint32_t desc)
 
 void HELPER(crypto_sha512su0)(void *vd, void *vn, uint32_t desc)
 {
+#ifdef NATIVE_SHA
+    if (cpuinfo & CPUINFO_SHA512) {
+        NATIVE_V(d, vd); NATIVE_V(n, vn);
+        asm(".arch_extension sha3\n sha512su0 %0.2d, %1.2d" : "+w"(d) : "w"(n));
+        NATIVE_DONE(vd, d, desc);
+    }
+#endif
+
     uint64_t *rd = vd;
     uint64_t *rn = vn;
     uint64_t d0 = rd[0];
@@ -480,6 +578,14 @@ void HELPER(crypto_sha512su0)(void *vd, void *vn, uint32_t desc)
 
 void HELPER(crypto_sha512su1)(void *vd, void *vn, void *vm, uint32_t desc)
 {
+#ifdef NATIVE_SHA
+    if (cpuinfo & CPUINFO_SHA512) {
+        NATIVE_V(d, vd); NATIVE_V(n, vn); NATIVE_V(m, vm);
+        asm(".arch_extension sha3\n sha512su1 %0.2d, %1.2d, %2.2d" : "+w"(d) : "w"(n), "w"(m));
+        NATIVE_DONE(vd, d, desc);
+    }
+#endif
+
     uint64_t *rd = vd;
     uint64_t *rn = vn;
     uint64_t *rm = vm;

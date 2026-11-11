@@ -408,9 +408,29 @@ AH_MINMAX_HELPER(vfp_ah_maxd, float64, float64, max)
  * The upper bytes of val (above the number specified by 'bytes') must have
  * been zeroed out by the caller.
  */
+/* iSH+: the host's CRC32 instructions, when it has them (cpuinfo) */
+#if defined(__aarch64__)
+#include "host/cpuinfo.h"
+#define NATIVE_CRC(INSN, W)                                                  \
+    asm(".arch_extension crc\n " INSN " %w0, %w0, %" W "1" : "+r"(a) : "r"(val))
+#endif
+
 uint64_t HELPER(crc32_64)(uint64_t acc, uint64_t val, uint32_t bytes)
 {
     uint8_t buf[8];
+
+#if defined(__aarch64__)
+    if (likely(cpuinfo & CPUINFO_CRC32)) {
+        uint32_t a = acc;
+
+        switch (bytes) {
+        case 1: NATIVE_CRC("crc32b", "w"); return a;
+        case 2: NATIVE_CRC("crc32h", "w"); return a;
+        case 4: NATIVE_CRC("crc32w", "w"); return a;
+        case 8: NATIVE_CRC("crc32x", "x"); return a;
+        }
+    }
+#endif
 
     stq_le_p(buf, val);
 
@@ -421,6 +441,19 @@ uint64_t HELPER(crc32_64)(uint64_t acc, uint64_t val, uint32_t bytes)
 uint64_t HELPER(crc32c_64)(uint64_t acc, uint64_t val, uint32_t bytes)
 {
     uint8_t buf[8];
+
+#if defined(__aarch64__)
+    if (likely(cpuinfo & CPUINFO_CRC32)) {
+        uint32_t a = acc;
+
+        switch (bytes) {
+        case 1: NATIVE_CRC("crc32cb", "w"); return a;
+        case 2: NATIVE_CRC("crc32ch", "w"); return a;
+        case 4: NATIVE_CRC("crc32cw", "w"); return a;
+        case 8: NATIVE_CRC("crc32cx", "x"); return a;
+        }
+    }
+#endif
 
     stq_le_p(buf, val);
 
