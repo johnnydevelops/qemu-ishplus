@@ -73,6 +73,9 @@ if opengl.found()
   egl_headless_ss = ss.source_set()
   egl_headless_ss.add(when: [egl, opengl, pixman],
                       if_true: files('egl-headless.c'))
+  if host_os == 'darwin'
+    egl_headless_ss.add(iosurface, coref)
+  endif
   ui_modules += {'egl-headless' : egl_headless_ss}
 endif
 

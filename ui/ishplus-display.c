@@ -40,9 +40,31 @@ void ishplus_input_scroll(int dx, int dy);
 void ishplus_input_key(int usb_usage, int down);
 void ishplus_gpu_pause(int pause);
 
+/*
+ * GPU frames (with GPU acceleration, egl-headless): the guest's screen as
+ * IOSurfaces (BGRA, first row at the top), shown as they are, instead of a
+ * copy in the surface (surface and update callbacks then stop until the
+ * screen is back to software, which a NULL surface tells). Called on QEMU's
+ * main loop thread; QEMU draws into the IOSurfaces that are not in use, so
+ * hold one with IOSurfaceIncrementUseCount while showing it.
+ */
+typedef void (*IshplusGpuFrame)(void *context, void *iosurface, int width, int height);
+void ishplus_display_set_gpu_frames(void *context, IshplusGpuFrame frame);
+bool ishplus_gpu_frames_wanted(void);
+void ishplus_gpu_frame(void *iosurface, int width, int height);
+/* For egl-headless: 0 never attached, 1 attached, 2 detached since; and a
+ * number that changes when the app (re)attaches or asks for GPU frames, so
+ * it gets the current screen */
+int ishplus_display_state(void);
+unsigned int ishplus_display_generation(void);
+
 static IshplusDisplayCallbacks callbacks;
 static DisplayChangeListener listener;
 static bool attached;
+static IshplusGpuFrame gpu_frame_callback;
+static bool ever_attached;
+static unsigned int generation;
+static void *gpu_frame_context;
 
 static void lock(bool *locked)
 {
@@ -157,6 +179,8 @@ int ishplus_display_attach(const IshplusDisplayCallbacks *new_callbacks)
         /* Reports the current surface (dpy_gfx_switch) */
         register_displaychangelistener(&listener);
         attached = true;
+        ever_attached = true;
+        generation++;
         ret = 0;
     }
     unlock(locked);
@@ -173,7 +197,43 @@ void ishplus_display_detach(void)
         attached = false;
     }
     memset(&callbacks, 0, sizeof(callbacks));
+    gpu_frame_callback = NULL;
+    gpu_frame_context = NULL;
     unlock(locked);
+}
+
+/* After ishplus_display_attach; NULL stops them (until the next attach) */
+void ishplus_display_set_gpu_frames(void *context, IshplusGpuFrame frame)
+{
+    bool locked;
+
+    lock(&locked);
+    gpu_frame_context = context;
+    gpu_frame_callback = frame;
+    generation++;
+    unlock(locked);
+}
+
+int ishplus_display_state(void)
+{
+    return attached ? 1 : ever_attached ? 2 : 0;
+}
+
+unsigned int ishplus_display_generation(void)
+{
+    return generation;
+}
+
+bool ishplus_gpu_frames_wanted(void)
+{
+    return attached && gpu_frame_callback;
+}
+
+void ishplus_gpu_frame(void *iosurface, int width, int height)
+{
+    if (attached && gpu_frame_callback) {
+        gpu_frame_callback(gpu_frame_context, iosurface, width, height);
+    }
 }
 
 /* The size the guest should use: virtio-gpu offers it as its preferred mode. */
