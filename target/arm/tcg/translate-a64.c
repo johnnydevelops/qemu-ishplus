@@ -5301,10 +5301,128 @@ typedef struct FPScalar {
     void (*gen_d)(TCGv_i64, TCGv_i64, TCGv_i64, TCGv_ptr);
 } FPScalar;
 
+/*
+ * iSH+: with an all-default FPCR (TB flag FPDEFAULT), floating point is
+ * emitted as the host's own instructions (tcg/aarch64 aa64_f*_vec): the
+ * host FPU then computes exactly what the guest's would, flags included
+ * (they collect in the host FPSR, see native-fp.h). Values are loaded
+ * from and stored to the vector registers in env; V64 is a scalar, V128
+ * a 4s/2d vector. Anything else (other FPCR modes, half precision, 64-bit
+ * vectors) uses the helpers.
+ */
+#ifdef TCG_TARGET_ISHPLUS_NATIVE_FP
+static void native_ld(TCGv_vec v, DisasContext *s, int reg)
+{
+    tcg_gen_ld_vec(v, tcg_env, vec_full_reg_offset(s, reg));
+}
+
+static void native_st(TCGv_vec v, DisasContext *s, int reg, bool is_q)
+{
+    tcg_gen_st_vec(v, tcg_env, vec_full_reg_offset(s, reg));
+    clear_vec_high(s, is_q, reg);
+}
+
+/* d = n op m */
+static void native_fp3(DisasContext *s, TCGOpcode op, bool is_q, MemOp esz,
+                       int rd, int rn, int rm)
+{
+    TCGType type = is_q ? TCG_TYPE_V128 : TCG_TYPE_V64;
+    TCGv_vec n = tcg_temp_new_vec(type), m = tcg_temp_new_vec(type);
+
+    native_ld(n, s, rn);
+    native_ld(m, s, rm);
+    tcg_gen_ishplus_fp_vec3(op, type, esz, n, n, m);
+    native_st(n, s, rd, is_q);
+}
+
+/* d = a +- n * m, fused */
+static void native_fp_fused(DisasContext *s, TCGOpcode op, bool is_q,
+                            MemOp esz, int rd, int ra, int rn, int rm)
+{
+    TCGType type = is_q ? TCG_TYPE_V128 : TCG_TYPE_V64;
+    TCGv_vec d = tcg_temp_new_vec(type), n = tcg_temp_new_vec(type);
+    TCGv_vec m = tcg_temp_new_vec(type);
+
+    native_ld(d, s, ra);
+    native_ld(n, s, rn);
+    native_ld(m, s, rm);
+    tcg_gen_ishplus_fp_vec4(op, type, esz, d, d, n, m);
+    native_st(d, s, rd, is_q);
+}
+
+static bool native_fp3_scalar_op(void (*gen_d)(TCGv_i64, TCGv_i64, TCGv_i64, TCGv_ptr),
+                                 TCGOpcode *op)
+{
+    if (gen_d == gen_helper_vfp_addd) {
+        *op = INDEX_op_aa64_fadd_vec;
+    } else if (gen_d == gen_helper_vfp_subd) {
+        *op = INDEX_op_aa64_fsub_vec;
+    } else if (gen_d == gen_helper_vfp_muld) {
+        *op = INDEX_op_aa64_fmul_vec;
+    } else if (gen_d == gen_helper_vfp_divd) {
+        *op = INDEX_op_aa64_fdiv_vec;
+    } else if (gen_d == gen_helper_vfp_maxd) {
+        *op = INDEX_op_aa64_fmax_vec;
+    } else if (gen_d == gen_helper_vfp_mind) {
+        *op = INDEX_op_aa64_fmin_vec;
+    } else if (gen_d == gen_helper_vfp_maxnumd) {
+        *op = INDEX_op_aa64_fmaxnm_vec;
+    } else if (gen_d == gen_helper_vfp_minnumd) {
+        *op = INDEX_op_aa64_fminnm_vec;
+    } else {
+        return false;
+    }
+    return true;
+}
+
+/* A vector op's helper (its single or double one): the opcode, fused or not */
+static bool native_fp3_vector_op(gen_helper_gvec_3_ptr *fn, TCGOpcode *op, bool *fused)
+{
+    static const struct {
+        gen_helper_gvec_3_ptr *s, *d;
+        TCGOpcode op;
+        bool fused;
+    } map[] = {
+        { gen_helper_gvec_fadd_s, gen_helper_gvec_fadd_d, INDEX_op_aa64_fadd_vec },
+        { gen_helper_gvec_fsub_s, gen_helper_gvec_fsub_d, INDEX_op_aa64_fsub_vec },
+        { gen_helper_gvec_fmul_s, gen_helper_gvec_fmul_d, INDEX_op_aa64_fmul_vec },
+        { gen_helper_gvec_fdiv_s, gen_helper_gvec_fdiv_d, INDEX_op_aa64_fdiv_vec },
+        { gen_helper_gvec_fmax_s, gen_helper_gvec_fmax_d, INDEX_op_aa64_fmax_vec },
+        { gen_helper_gvec_fmin_s, gen_helper_gvec_fmin_d, INDEX_op_aa64_fmin_vec },
+        { gen_helper_gvec_fmaxnum_s, gen_helper_gvec_fmaxnum_d, INDEX_op_aa64_fmaxnm_vec },
+        { gen_helper_gvec_fminnum_s, gen_helper_gvec_fminnum_d, INDEX_op_aa64_fminnm_vec },
+        { gen_helper_gvec_fabd_s, gen_helper_gvec_fabd_d, INDEX_op_aa64_fabd_vec },
+        { gen_helper_gvec_vfma_s, gen_helper_gvec_vfma_d, INDEX_op_aa64_fmla_vec, true },
+        { gen_helper_gvec_vfms_s, gen_helper_gvec_vfms_d, INDEX_op_aa64_fmls_vec, true },
+    };
+
+    for (int i = 0; i < ARRAY_SIZE(map); i++) {
+        if (fn == map[i].s || fn == map[i].d) {
+            *op = map[i].op;
+            *fused = map[i].fused;
+            return true;
+        }
+    }
+    return false;
+}
+#endif
+
 static bool do_fp3_scalar_with_fpsttype(DisasContext *s, arg_rrr_e *a,
                                         const FPScalar *f, int mergereg,
                                         ARMFPStatusFlavour fpsttype)
 {
+#ifdef TCG_TARGET_ISHPLUS_NATIVE_FP
+    TCGOpcode nop;
+
+    if (s->fp_native && fpsttype == FPST_A64 &&
+        (a->esz == MO_32 || a->esz == MO_64) &&
+        native_fp3_scalar_op(f->gen_d, &nop)) {
+        if (fp_access_check(s)) {
+            native_fp3(s, nop, false, a->esz, a->rd, a->rn, a->rm);
+        }
+        return true;
+    }
+#endif
     switch (a->esz) {
     case MO_64:
         if (fp_access_check(s)) {
@@ -5855,6 +5973,23 @@ static bool do_fp3_vector_with_fpsttype(DisasContext *s, arg_qrrr_e *a,
         return check == 0;
     }
 
+#ifdef TCG_TARGET_ISHPLUS_NATIVE_FP
+    {
+        TCGOpcode nop;
+        bool fused;
+
+        if (s->fp_native && fpsttype == FPST_A64 && a->q && data == 0 &&
+            (esz == MO_32 || esz == MO_64) &&
+            native_fp3_vector_op(fns[esz - 1], &nop, &fused)) {
+            if (fused) {
+                native_fp_fused(s, nop, true, esz, a->rd, a->rd, a->rn, a->rm);
+            } else {
+                native_fp3(s, nop, true, esz, a->rd, a->rn, a->rm);
+            }
+            return true;
+        }
+    }
+#endif
     gen_gvec_op3_fpst(s, a->q, a->rd, a->rn, a->rm, fpsttype,
                       data, fns[esz - 1]);
     return true;
@@ -6817,6 +6952,21 @@ static bool do_fp3_vector_idx(DisasContext *s, arg_qrrx_e *a,
         return check == 0;
     }
 
+#ifdef TCG_TARGET_ISHPLUS_NATIVE_FP
+    /* iSH+: FMUL by element, as the host's FMUL with the element duplicated */
+    if (s->fp_native && a->q && (esz == MO_32 || esz == MO_64) &&
+        (fns[esz - 1] == gen_helper_gvec_fmul_idx_s ||
+         fns[esz - 1] == gen_helper_gvec_fmul_idx_d)) {
+        TCGv_vec n = tcg_temp_new_vec(TCG_TYPE_V128);
+        TCGv_vec m = tcg_temp_new_vec(TCG_TYPE_V128);
+
+        native_ld(n, s, a->rn);
+        tcg_gen_dup_mem_vec(esz, m, tcg_env, vec_reg_offset(s, a->rm, a->idx, esz));
+        tcg_gen_ishplus_fp_vec3(INDEX_op_aa64_fmul_vec, TCG_TYPE_V128, esz, n, n, m);
+        native_st(n, s, a->rd, true);
+        return true;
+    }
+#endif
     gen_gvec_op3_fpst(s, a->q, a->rd, a->rn, a->rm,
                       esz == MO_16 ? FPST_A64_F16 : FPST_A64,
                       a->idx, fns[esz - 1]);
@@ -6857,6 +7007,22 @@ static bool do_fmla_vector_idx(DisasContext *s, arg_qrrx_e *a, bool neg)
         return check == 0;
     }
 
+#ifdef TCG_TARGET_ISHPLUS_NATIVE_FP
+    /* iSH+: FMLA/FMLS by element, the host's with the element duplicated */
+    if (s->fp_native && a->q && (esz == MO_32 || esz == MO_64)) {
+        TCGv_vec d = tcg_temp_new_vec(TCG_TYPE_V128);
+        TCGv_vec n = tcg_temp_new_vec(TCG_TYPE_V128);
+        TCGv_vec m = tcg_temp_new_vec(TCG_TYPE_V128);
+
+        native_ld(d, s, a->rd);
+        native_ld(n, s, a->rn);
+        tcg_gen_dup_mem_vec(esz, m, tcg_env, vec_reg_offset(s, a->rm, a->idx, esz));
+        tcg_gen_ishplus_fp_vec4(neg ? INDEX_op_aa64_fmls_vec : INDEX_op_aa64_fmla_vec,
+                                TCG_TYPE_V128, esz, d, d, n, m);
+        native_st(d, s, a->rd, true);
+        return true;
+    }
+#endif
     gen_gvec_op4_fpst(s, a->q, a->rd, a->rn, a->rm, a->rd,
                       esz == MO_16 ? FPST_A64_F16 : FPST_A64,
                       a->idx, fns[neg ? 1 + s->fpcr_ah : 0][esz - 1]);
@@ -7198,6 +7364,17 @@ static bool do_fmadd(DisasContext *s, arg_rrrr_e *a, bool neg_a, bool neg_n)
      * as separate steps is correct: an input NaN should come out with
      * its sign bit flipped if it is a negated-input.
      */
+#ifdef TCG_TARGET_ISHPLUS_NATIVE_FP
+    if (s->fp_native && (a->esz == MO_32 || a->esz == MO_64)) {
+        /* FMADD, FMSUB, FNMADD, FNMSUB: the host's, same operands */
+        TCGOpcode nop = neg_a ? (neg_n ? INDEX_op_aa64_fnmla_vec : INDEX_op_aa64_fnmls_vec)
+                              : (neg_n ? INDEX_op_aa64_fmls_vec : INDEX_op_aa64_fmla_vec);
+        if (fp_access_check(s)) {
+            native_fp_fused(s, nop, false, a->esz, a->rd, a->ra, a->rn, a->rm);
+        }
+        return true;
+    }
+#endif
     switch (a->esz) {
     case MO_64:
         if (fp_access_check(s)) {
@@ -10261,6 +10438,9 @@ static void aarch64_tr_init_disas_context(DisasContextBase *dcbase,
     dc->nv2_mem_be = EX_TBFLAG_A64(tb_flags, NV2_MEM_BE);
     dc->fpcr_ah = EX_TBFLAG_A64(tb_flags, AH);
     dc->fpcr_nep = EX_TBFLAG_A64(tb_flags, NEP);
+#ifdef TCG_TARGET_ISHPLUS_NATIVE_FP
+    dc->fp_native = EX_TBFLAG_A64(tb_flags, FPDEFAULT);
+#endif
     dc->vec_len = 0;
     dc->vec_stride = 0;
     dc->cp_regs = arm_cpu->cp_regs;

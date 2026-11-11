@@ -161,6 +161,8 @@ typedef struct DisasContext {
     bool nv2_mem_be;
     /* True if FPCR.AH is 1 (alternate floating point handling) */
     bool fpcr_ah;
+    /* iSH+: FPCR is all default: floating point as host instructions */
+    bool fp_native;
     /* True if FPCR.NEP is 1 (FEAT_AFP scalar upper-element result handling) */
     bool fpcr_nep;
     /*

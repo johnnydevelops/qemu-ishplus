@@ -3112,6 +3112,8 @@ FIELD(TBFLAG_A64, NV2_MEM_E20, 35, 1)
 FIELD(TBFLAG_A64, NV2_MEM_BE, 36, 1)
 FIELD(TBFLAG_A64, AH, 37, 1)   /* FPCR.AH */
 FIELD(TBFLAG_A64, NEP, 38, 1)   /* FPCR.NEP */
+/* iSH+: FPCR is all default (host floating point is the guest's) */
+FIELD(TBFLAG_A64, FPDEFAULT, 39, 1)
 
 /*
  * Helpers for using the above. Note that only the A64 accessors use

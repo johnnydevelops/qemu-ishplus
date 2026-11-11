@@ -416,6 +416,15 @@ static CPUARMTBFlags rebuild_hflags_a64(CPUARMState *env, int el, int fp_el,
     if (env->vfp.fpcr & FPCR_AH) {
         DP_TBFLAG_A64(flags, AH, 1);
     }
+    /*
+     * iSH+: with an all-default FPCR, translate-a64.c emits floating point
+     * as the host's own instructions (FPCR writes end the TB and rebuild
+     * these flags).
+     */
+    if (!(env->vfp.fpcr & (FPCR_RMODE_MASK | FPCR_FZ | FPCR_DN | FPCR_AH |
+                           FPCR_FIZ | FPCR_NEP))) {
+        DP_TBFLAG_A64(flags, FPDEFAULT, 1);
+    }
     if (env->vfp.fpcr & FPCR_NEP) {
         /*
          * In streaming-SVE without FA64, NEP behaves as if zero;

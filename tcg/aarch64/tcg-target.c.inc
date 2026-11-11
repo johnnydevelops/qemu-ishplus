@@ -2725,6 +2725,78 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
             tcg_out_insn(s, 3616, USHL, is_q, vece, a0, a1, a2);
         }
         break;
+    /* iSH+: floating point (tcg-target-opc.h.inc), V64 scalar, V128 vector */
+    case INDEX_op_aa64_fadd_vec:
+    case INDEX_op_aa64_fsub_vec:
+    case INDEX_op_aa64_fmul_vec:
+    case INDEX_op_aa64_fdiv_vec:
+    case INDEX_op_aa64_fmax_vec:
+    case INDEX_op_aa64_fmin_vec:
+    case INDEX_op_aa64_fmaxnm_vec:
+    case INDEX_op_aa64_fminnm_vec:
+    case INDEX_op_aa64_fabd_vec:
+        {
+            static const uint32_t vec_insn[] = {
+                [INDEX_op_aa64_fadd_vec - INDEX_op_aa64_fadd_vec] = 0x4e20d400,
+                [INDEX_op_aa64_fsub_vec - INDEX_op_aa64_fadd_vec] = 0x4ea0d400,
+                [INDEX_op_aa64_fmul_vec - INDEX_op_aa64_fadd_vec] = 0x6e20dc00,
+                [INDEX_op_aa64_fdiv_vec - INDEX_op_aa64_fadd_vec] = 0x6e20fc00,
+                [INDEX_op_aa64_fmax_vec - INDEX_op_aa64_fadd_vec] = 0x4e20f400,
+                [INDEX_op_aa64_fmin_vec - INDEX_op_aa64_fadd_vec] = 0x4ea0f400,
+                [INDEX_op_aa64_fmaxnm_vec - INDEX_op_aa64_fadd_vec] = 0x4e20c400,
+                [INDEX_op_aa64_fminnm_vec - INDEX_op_aa64_fadd_vec] = 0x4ea0c400,
+                [INDEX_op_aa64_fabd_vec - INDEX_op_aa64_fadd_vec] = 0x6ea0d400,
+            };
+            static const uint32_t scalar_insn[] = {
+                [INDEX_op_aa64_fadd_vec - INDEX_op_aa64_fadd_vec] = 0x1e202800,
+                [INDEX_op_aa64_fsub_vec - INDEX_op_aa64_fadd_vec] = 0x1e203800,
+                [INDEX_op_aa64_fmul_vec - INDEX_op_aa64_fadd_vec] = 0x1e200800,
+                [INDEX_op_aa64_fdiv_vec - INDEX_op_aa64_fadd_vec] = 0x1e201800,
+                [INDEX_op_aa64_fmax_vec - INDEX_op_aa64_fadd_vec] = 0x1e204800,
+                [INDEX_op_aa64_fmin_vec - INDEX_op_aa64_fadd_vec] = 0x1e205800,
+                [INDEX_op_aa64_fmaxnm_vec - INDEX_op_aa64_fadd_vec] = 0x1e206800,
+                [INDEX_op_aa64_fminnm_vec - INDEX_op_aa64_fadd_vec] = 0x1e207800,
+                [INDEX_op_aa64_fabd_vec - INDEX_op_aa64_fadd_vec] = 0x7ea0d400,
+            };
+            unsigned i = opc - INDEX_op_aa64_fadd_vec;
+            uint32_t insn = is_q ? vec_insn[i] : scalar_insn[i];
+
+            tcg_debug_assert(vece == MO_32 || vece == MO_64);
+            tcg_out32(s, insn | (vece == MO_64) << 22 | (a2 & 31) << 16 |
+                      (a1 & 31) << 5 | (a0 & 31));
+        }
+        break;
+    case INDEX_op_aa64_fsqrt_vec:
+        tcg_debug_assert(vece == MO_32 || vece == MO_64);
+        tcg_out32(s, (is_q ? 0x6ea1f800 : 0x1e21c000) | (vece == MO_64) << 22 |
+                  (a1 & 31) << 5 | (a0 & 31));
+        break;
+    case INDEX_op_aa64_fmla_vec:
+    case INDEX_op_aa64_fmls_vec:
+    case INDEX_op_aa64_fnmla_vec:
+    case INDEX_op_aa64_fnmls_vec:
+        /* d (a0) = a (a1, the same register) +- n (a2) * m (args[3]) */
+        tcg_debug_assert(vece == MO_32 || vece == MO_64);
+        tcg_debug_assert(a0 == a1);
+        if (is_q) {
+            /* vectors: fmla/fmls only */
+            tcg_debug_assert(opc == INDEX_op_aa64_fmla_vec ||
+                             opc == INDEX_op_aa64_fmls_vec);
+            tcg_out32(s, (opc == INDEX_op_aa64_fmla_vec ? 0x4e20cc00 : 0x4ea0cc00) |
+                      (vece == MO_64) << 22 | (args[3] & 31) << 16 |
+                      (a2 & 31) << 5 | (a0 & 31));
+        } else {
+            static const uint32_t fused[] = {
+                [INDEX_op_aa64_fmla_vec - INDEX_op_aa64_fmla_vec] = 0x1f000000, /* fmadd */
+                [INDEX_op_aa64_fmls_vec - INDEX_op_aa64_fmla_vec] = 0x1f008000, /* fmsub */
+                [INDEX_op_aa64_fnmla_vec - INDEX_op_aa64_fmla_vec] = 0x1f200000, /* fnmadd */
+                [INDEX_op_aa64_fnmls_vec - INDEX_op_aa64_fmla_vec] = 0x1f208000, /* fnmsub */
+            };
+            tcg_out32(s, fused[opc - INDEX_op_aa64_fmla_vec] | (vece == MO_64) << 22 |
+                      (args[3] & 31) << 16 | (a1 & 31) << 10 | (a2 & 31) << 5 |
+                      (a0 & 31));
+        }
+        break;
     case INDEX_op_aa64_sshl_vec:
         if (is_scalar) {
             tcg_out_insn(s, 3611, SSHL, vece, a0, a1, a2);
@@ -3140,6 +3212,23 @@ tcg_target_op_def(TCGOpcode op, TCGType type, unsigned flags)
         return C_O1_I3(w, w, w, w);
     case INDEX_op_aa64_sli_vec:
         return C_O1_I2(w, 0, w);
+    case INDEX_op_aa64_fadd_vec:
+    case INDEX_op_aa64_fsub_vec:
+    case INDEX_op_aa64_fmul_vec:
+    case INDEX_op_aa64_fdiv_vec:
+    case INDEX_op_aa64_fmax_vec:
+    case INDEX_op_aa64_fmin_vec:
+    case INDEX_op_aa64_fmaxnm_vec:
+    case INDEX_op_aa64_fminnm_vec:
+    case INDEX_op_aa64_fabd_vec:
+        return C_O1_I2(w, w, w);
+    case INDEX_op_aa64_fsqrt_vec:
+        return C_O1_I1(w, w);
+    case INDEX_op_aa64_fmla_vec:
+    case INDEX_op_aa64_fmls_vec:
+    case INDEX_op_aa64_fnmla_vec:
+    case INDEX_op_aa64_fnmls_vec:
+        return C_O1_I3(w, 0, w, w);
 
     default:
         return C_NotImplemented;

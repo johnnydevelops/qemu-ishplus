@@ -49,4 +49,7 @@ typedef enum {
 
 #define TCG_TARGET_NB_REGS 64
 
+/* iSH+: the aa64_f*_vec floating point opcodes (tcg-target-opc.h.inc) */
+#define TCG_TARGET_ISHPLUS_NATIVE_FP 1
+
 #endif /* AARCH64_TCG_TARGET_H */

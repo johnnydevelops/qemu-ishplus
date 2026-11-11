@@ -141,6 +141,28 @@ bool tcg_can_emit_vecop_list(const TCGOpcode *list,
     return true;
 }
 
+#ifdef TCG_TARGET_ISHPLUS_NATIVE_FP
+/* iSH+: the host's floating point opcodes, for target/arm (tcg-target-opc.h.inc) */
+void tcg_gen_ishplus_fp_vec2(TCGOpcode opc, TCGType type, unsigned vece,
+                             TCGv_vec r, TCGv_vec a)
+{
+    vec_gen_2(opc, type, vece, tcgv_vec_arg(r), tcgv_vec_arg(a));
+}
+
+void tcg_gen_ishplus_fp_vec3(TCGOpcode opc, TCGType type, unsigned vece,
+                             TCGv_vec r, TCGv_vec a, TCGv_vec b)
+{
+    vec_gen_3(opc, type, vece, tcgv_vec_arg(r), tcgv_vec_arg(a), tcgv_vec_arg(b));
+}
+
+void tcg_gen_ishplus_fp_vec4(TCGOpcode opc, TCGType type, unsigned vece,
+                             TCGv_vec r, TCGv_vec a, TCGv_vec b, TCGv_vec c)
+{
+    vec_gen_4(opc, type, vece, tcgv_vec_arg(r), tcgv_vec_arg(a),
+              tcgv_vec_arg(b), tcgv_vec_arg(c));
+}
+#endif
+
 void vec_gen_2(TCGOpcode opc, TCGType type, unsigned vece, TCGArg r, TCGArg a)
 {
     TCGOp *op = tcg_emit_op(opc, 2);

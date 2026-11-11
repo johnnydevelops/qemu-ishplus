@@ -434,6 +434,14 @@ void tcg_gen_usadd_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b);
 void tcg_gen_sssub_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b);
 void tcg_gen_ussub_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b);
 void tcg_gen_smin_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b);
+#ifdef TCG_TARGET_ISHPLUS_NATIVE_FP
+void tcg_gen_ishplus_fp_vec2(TCGOpcode opc, TCGType type, unsigned vece,
+                             TCGv_vec r, TCGv_vec a);
+void tcg_gen_ishplus_fp_vec3(TCGOpcode opc, TCGType type, unsigned vece,
+                             TCGv_vec r, TCGv_vec a, TCGv_vec b);
+void tcg_gen_ishplus_fp_vec4(TCGOpcode opc, TCGType type, unsigned vece,
+                             TCGv_vec r, TCGv_vec a, TCGv_vec b, TCGv_vec c);
+#endif
 void tcg_gen_umin_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b);
 void tcg_gen_smax_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b);
 void tcg_gen_umax_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b);
