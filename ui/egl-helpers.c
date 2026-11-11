@@ -134,8 +134,9 @@ void egl_fb_setup_new_tex_target(egl_fb *fb, int width, int height, GLenum targe
 
     glGenTextures(1, &texture);
     glBindTexture(target, texture);
-    glTexImage2D(target, 0, GL_RGBA, width, height,
-                 0, GL_BGRA, GL_UNSIGNED_BYTE, 0);
+    /* GL ES (EXT_texture_format_BGRA8888) needs matching formats */
+    glTexImage2D(target, 0, qemu_egl_mode == DISPLAY_GL_MODE_ES ? GL_BGRA : GL_RGBA,
+                 width, height, 0, GL_BGRA, GL_UNSIGNED_BYTE, 0);
 
     egl_fb_setup_for_tex_target(fb, width, height, texture, target, true);
 }
@@ -696,7 +697,12 @@ EGLContext qemu_egl_init_ctx(void)
         EGL_NONE
     };
     static const EGLint ctx_att_gles[] = {
+#ifdef __APPLE__
+        /* ANGLE: glBlitFramebuffer and glReadBuffer need GL ES 3 */
+        EGL_CONTEXT_CLIENT_VERSION, 3,
+#else
         EGL_CONTEXT_CLIENT_VERSION, 2,
+#endif
         EGL_NONE
     };
     bool gles = (qemu_egl_mode == DISPLAY_GL_MODE_ES);
@@ -743,6 +749,24 @@ bool egl_init(const char *rendernode, DisplayGLMode mode, Error **errp)
         error_setg(errp, "egl: render node init failed");
         return false;
     }
+#elif defined(__APPLE__)
+    /*
+     * ANGLE over Metal: GL ES only, surfaceless contexts. ANGLE's default
+     * backend on Apple platforms is OpenGL (macOS) or EAGL (iOS); ask for
+     * Metal unless told otherwise.
+     */
+    setenv("ANGLE_DEFAULT_PLATFORM", "metal", 0);
+    if (qemu_egl_init_dpy_cocoa(DISPLAY_GL_MODE_ES) < 0) {
+        error_setg(errp, "egl: ANGLE init failed");
+        return false;
+    }
+    qemu_egl_rn_ctx = qemu_egl_init_ctx();
+    if (!qemu_egl_rn_ctx) {
+        error_setg(errp, "egl: egl_init_ctx failed");
+        return false;
+    }
+    info_report("egl: %s, %s", (const char *)glGetString(GL_RENDERER),
+                (const char *)glGetString(GL_VERSION));
 #endif
 
     if (!qemu_egl_rn_ctx) {
