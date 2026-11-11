@@ -735,8 +735,9 @@ static void tlb_flush_range_by_mmuidx_async_0(CPUState *cpu,
     /*
      * If the length is larger than the jump cache size, then it will take
      * longer to clear each entry individually than it will to clear it all.
+     * iSH+: clearing it all is a new generation, so beyond 64 pages.
      */
-    if (d.len >= (TARGET_PAGE_SIZE * TB_JMP_CACHE_SIZE)) {
+    if (d.len >= TARGET_PAGE_SIZE * 64) {
         tcg_flush_jmp_cache(cpu);
         return;
     }

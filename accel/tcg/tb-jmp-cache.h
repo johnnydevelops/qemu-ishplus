@@ -12,7 +12,13 @@
 #include "qemu/rcu.h"
 #include "exec/cpu-common.h"
 
-#define TB_JMP_CACHE_BITS 12
+/*
+ * iSH+: 64K entries instead of 4K (1.5 MB per vCPU): the kernel's and the
+ * programs' code missed in 4K, and every miss is a hash table lookup. A
+ * whole flush (every guest context switch changes the ASID) only bumps
+ * the generation, so a bigger cache costs nothing there.
+ */
+#define TB_JMP_CACHE_BITS 16
 #define TB_JMP_CACHE_SIZE (1 << TB_JMP_CACHE_BITS)
 
 /*
@@ -24,9 +30,12 @@
  */
 typedef struct CPUJumpCache {
     struct rcu_head rcu;
+    /* iSH+: entries of other generations are empty (tcg_flush_jmp_cache) */
+    uint64_t gen;
     struct {
         TranslationBlock *tb;
         vaddr pc;
+        uint64_t gen;
     } array[TB_JMP_CACHE_SIZE];
 } CPUJumpCache;
 
