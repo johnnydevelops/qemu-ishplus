@@ -1702,7 +1702,12 @@ int virtio_gpu_virgl_init(VirtIOGPU *g)
     }
 #endif
 
-#if VIRGL_CHECK_VERSION(1, 1, 2)
+    /*
+     * Not on Apple systems: there is no eventfd, so the proxy has no sync
+     * thread, and its fences are only retired by polling (which
+     * virglrenderer then does; see virgl_renderer_init).
+     */
+#if VIRGL_CHECK_VERSION(1, 1, 2) && !defined(__APPLE__)
     if (flags & VIRGL_RENDERER_RENDER_SERVER) {
         /*
          * Async fencing needs no EGL on the render-server path: the proxy
