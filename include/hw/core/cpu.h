@@ -238,6 +238,13 @@ struct CPUTLBEntryFull {
     uint8_t tlb_fill_flags;
 
     /*
+     * iSH+: set by tlb_fill_align when this is a block (large page) mapping
+     * of ordinary memory whose other pages translate the same way, so that
+     * cputlb can fill them from it without walking the page tables again.
+     */
+    bool ishplus_block_reuse;
+
+    /*
      * Additional tlb flags for use by the slow path. If non-zero,
      * the corresponding CPUTLBEntry comparator must have TLB_FORCE_SLOW.
      */
@@ -289,6 +296,14 @@ typedef struct CPUTLBDesc {
     CPUTLBEntry vtable[CPU_VTLB_SIZE];
     CPUTLBEntryFull vfulltlb[CPU_VTLB_SIZE];
     CPUTLBEntryFull *fulltlb;
+    /*
+     * iSH+: the last reusable block translation (ishplus_block_reuse), its
+     * phys_addr the block's base: pages of the block that miss in the TLB
+     * are filled from it until this mmu_idx is flushed in any way.
+     */
+    vaddr ishplus_block_addr;
+    vaddr ishplus_block_mask;
+    CPUTLBEntryFull ishplus_block_full;
 } CPUTLBDesc;
 
 /*

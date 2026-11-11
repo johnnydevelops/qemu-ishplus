@@ -360,6 +360,14 @@ bool arm_cpu_tlb_fill_align(CPUState *cs, CPUTLBEntryFull *out, vaddr address,
                               &res, fi)) {
         res.f.extra.arm.pte_attrs = res.cacheattrs.attrs;
         res.f.extra.arm.shareability = res.cacheattrs.shareability;
+        /*
+         * iSH+: a block of Normal memory (MAIR outer nibble non-zero) with
+         * no special TLB flags translates its other pages the same way, so
+         * cputlb may fill them from this result (CPUTLBEntryFull).
+         */
+        res.f.ishplus_block_reuse = res.f.lg_page_size > TARGET_PAGE_BITS &&
+                                    (res.cacheattrs.attrs & 0xf0) &&
+                                    !res.f.tlb_fill_flags;
         *out = res.f;
         return true;
     }

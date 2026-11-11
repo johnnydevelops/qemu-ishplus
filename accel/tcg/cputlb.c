@@ -273,8 +273,16 @@ static void tlb_mmu_resize_locked(CPUTLBDesc *desc, CPUTLBDescFast *fast,
     }
 }
 
+/* iSH+: forget the block translation reused for fills (tlb_fill_align) */
+static inline void tlb_block_cache_clear(CPUTLBDesc *desc)
+{
+    desc->ishplus_block_addr = -1;
+    desc->ishplus_block_mask = -1;
+}
+
 static void tlb_mmu_flush_locked(CPUTLBDesc *desc, CPUTLBDescFast *fast)
 {
+    tlb_block_cache_clear(desc);
     desc->n_used_entries = 0;
     desc->large_page_addr = -1;
     desc->large_page_mask = -1;
@@ -501,6 +509,8 @@ static void tlb_flush_page_locked(CPUState *cpu, int midx, vaddr page)
     vaddr lp_addr = cpu->neg.tlb.d[midx].large_page_addr;
     vaddr lp_mask = cpu->neg.tlb.d[midx].large_page_mask;
 
+    tlb_block_cache_clear(&cpu->neg.tlb.d[midx]);
+
     /* Check if we need to flush due to large pages.  */
     if ((page & lp_mask) == lp_addr) {
         tlb_debug("forcing full flush midx %d (%016"
@@ -664,6 +674,8 @@ static void tlb_flush_range_locked(CPUState *cpu, int midx,
     CPUTLBDesc *d = &cpu->neg.tlb.d[midx];
     CPUTLBDescFast *f = &cpu->neg.tlb.f[midx];
     vaddr mask = MAKE_64BIT_MASK(0, bits);
+
+    tlb_block_cache_clear(d);
 
     /*
      * If @bits is smaller than the tlb size, there may be multiple entries
@@ -1239,8 +1251,39 @@ static bool tlb_fill_align(CPUState *cpu, vaddr addr, MMUAccessType type,
     CPUTLBEntryFull full;
 
     if (ops->tlb_fill_align) {
+        /*
+         * iSH+: a page of the block (large page) translated last, filled
+         * from that translation instead of walking the page tables again
+         * (Linux maps most memory with 2 MB blocks; the TLB holds 4 KB
+         * pages). Only for an access the block allows, and aligned as the
+         * memop requires (the walk would have checked that first).
+         */
+        CPUTLBDesc *d = &cpu->neg.tlb.d[mmu_idx];
+        int need = type == MMU_DATA_STORE ? PAGE_WRITE :
+                   type == MMU_INST_FETCH ? PAGE_EXEC : PAGE_READ;
+
+        if ((addr & d->ishplus_block_mask) == d->ishplus_block_addr &&
+            (d->ishplus_block_full.prot & need) &&
+            !(addr & ((1u << memop_alignment_bits(memop)) - 1)) &&
+            !(type == MMU_INST_FETCH && (addr & 3))) {
+            full = d->ishplus_block_full;
+            full.phys_addr |= addr & ~d->ishplus_block_mask;
+            tlb_set_page_full(cpu, mmu_idx, addr, &full);
+            return true;
+        }
+        memset(&full, 0, sizeof(full));
         if (ops->tlb_fill_align(cpu, &full, addr, type, mmu_idx,
                                 memop, size, probe, ra)) {
+            if (full.ishplus_block_reuse &&
+                full.lg_page_size > TARGET_PAGE_BITS &&
+                full.lg_page_size < TARGET_LONG_BITS) {
+                vaddr mask = ~(vaddr)0 << full.lg_page_size;
+
+                d->ishplus_block_full = full;
+                d->ishplus_block_full.phys_addr &= mask;
+                d->ishplus_block_addr = addr & mask;
+                d->ishplus_block_mask = mask;
+            }
             tlb_set_page_full(cpu, mmu_idx, addr, &full);
             return true;
         }
