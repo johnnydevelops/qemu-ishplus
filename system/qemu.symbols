@@ -12,6 +12,7 @@
   ishplus_input_button;
   ishplus_input_scroll;
   ishplus_input_key;
+  ishplus_gpu_pause;
   bql_lock_impl;
   bql_unlock;
   g_assertion_message_expr;

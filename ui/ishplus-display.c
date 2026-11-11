@@ -16,6 +16,9 @@
 #include "ui/console.h"
 #include "ui/input.h"
 #include "ui/surface.h"
+#ifdef CONFIG_OPENGL
+#include "ui/egl-helpers.h"
+#endif
 
 typedef struct IshplusDisplayCallbacks {
     void *context;
@@ -35,6 +38,7 @@ void ishplus_input_pointer(int x, int y);
 void ishplus_input_button(int button, int down);
 void ishplus_input_scroll(int dx, int dy);
 void ishplus_input_key(int usb_usage, int down);
+void ishplus_gpu_pause(int pause);
 
 static IshplusDisplayCallbacks callbacks;
 static DisplayChangeListener listener;
@@ -292,6 +296,43 @@ void ishplus_input_key(int usb_usage, int down)
     con = input_console();
     if (con) {
         qemu_input_event_send_key_qcode(con, qcode, down);
+    }
+    unlock(locked);
+}
+
+/*
+ * iOS refuses GPU work from apps in the background (Metal command buffers
+ * fail). While paused, virtio-gpu leaves the guest's commands queued (the
+ * guest waits for them), and the GPU work already submitted is finished
+ * before this returns. Call before the app enters the background, and with
+ * 0 when it is back.
+ */
+void ishplus_gpu_pause(int pause)
+{
+    static bool paused;
+    bool locked;
+    QemuConsole *con;
+
+    lock(&locked);
+    con = attached ? listener.con : graphic_console();
+    if (con && pause && !paused) {
+        graphic_hw_gl_block(con, true);
+        paused = true;
+#ifdef CONFIG_OPENGL
+        if (qemu_egl_display && qemu_egl_rn_ctx) {
+            EGLContext current = eglGetCurrentContext();
+            /* Switching contexts flushes the other contexts' work to the
+             * one queue that glFinish then waits for */
+            eglMakeCurrent(qemu_egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, qemu_egl_rn_ctx);
+            glFinish();
+            if (current != EGL_NO_CONTEXT) {
+                eglMakeCurrent(qemu_egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, current);
+            }
+        }
+#endif
+    } else if (con && !pause && paused) {
+        paused = false;
+        graphic_hw_gl_block(con, false);
     }
     unlock(locked);
 }
