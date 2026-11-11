@@ -4,6 +4,13 @@
   qemu_cleanup;
   ishplus_console_resize;
   ishplus_9p_set_owner;
+  ishplus_display_attach;
+  ishplus_display_detach;
+  ishplus_display_set_size;
+  ishplus_input_pointer;
+  ishplus_input_button;
+  ishplus_input_scroll;
+  ishplus_input_key;
   bql_lock_impl;
   bql_unlock;
   g_assertion_message_expr;

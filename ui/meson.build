@@ -12,6 +12,7 @@ system_ss.add(files(
   'input-legacy.c',
   'input-barrier.c',
   'input.c',
+  'ishplus-display.c',
   'kbd-state.c',
   'keymaps.c',
   'qemu-pixman.c',
