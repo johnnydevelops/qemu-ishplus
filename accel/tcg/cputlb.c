@@ -280,9 +280,13 @@ static inline void tlb_block_cache_clear(CPUTLBDesc *desc)
     desc->ishplus_block_mask = -1;
 }
 
+/* iSH+: the most entries a TLB grows to between flushes (16K: 64 MB) */
+#define ISHPLUS_TLB_GROW_MAX_BITS MIN(14, CPU_TLB_DYN_MAX_BITS)
+
 static void tlb_mmu_flush_locked(CPUTLBDesc *desc, CPUTLBDescFast *fast)
 {
     tlb_block_cache_clear(desc);
+    desc->ishplus_evictions = 0;
     desc->n_used_entries = 0;
     desc->large_page_addr = -1;
     desc->large_page_mask = -1;
@@ -300,6 +304,34 @@ static void tlb_flush_one_mmuidx_locked(CPUState *cpu, int mmu_idx,
     tlb_mmu_resize_locked(desc, fast, now);
     tlb_mmu_flush_locked(desc, fast);
 }
+
+/*
+ * iSH+: TLBs set aside per address space (CPUTLBStash). The guest changing
+ * ASID (a process switch, for Linux) made QEMU flush every TLB; instead the
+ * EL1&0 TLBs are set aside under the old ASID and those of the new one put
+ * back. Set-aside TLBs get the same page/range flushes and dirty tracking
+ * as the live one; any full flush drops them.
+ */
+/* Larger TLBs are not kept: their memory, and scanning them in tlb_reset_dirty */
+#define ISHPLUS_TLB_STASH_MAX_BITS 12
+
+static void tlb_stash_free(CPUTLBStash *st)
+{
+    g_free(st->table);
+    g_free(st->fulltlb);
+    memset(st, 0, sizeof(*st));
+}
+
+static void tlb_stash_drop_all(CPUTLBDesc *desc)
+{
+    for (int i = 0; i < CPU_TLB_STASH; i++) {
+        if (desc->ishplus_stash[i].key) {
+            tlb_stash_free(&desc->ishplus_stash[i]);
+        }
+    }
+}
+
+static void tlb_flush_entry_in_stash(CPUTLBStash *st, vaddr page, vaddr mask);
 
 static void tlb_mmu_init(CPUTLBDesc *desc, CPUTLBDescFast *fast, int64_t now)
 {
@@ -349,6 +381,7 @@ void tlb_destroy(CPUState *cpu)
 
         g_free(fast->table);
         g_free(desc->fulltlb);
+        tlb_stash_drop_all(desc);
     }
 }
 
@@ -392,6 +425,10 @@ static void tlb_flush_by_mmuidx_async_work(CPUState *cpu, run_on_cpu_data data)
         int mmu_idx = ctz32(work);
         tlb_flush_one_mmuidx_locked(cpu, mmu_idx, now);
     }
+    /* iSH+: and the TLBs set aside for other address spaces */
+    for (work = asked; work != 0; work &= work - 1) {
+        tlb_stash_drop_all(&cpu->neg.tlb.d[ctz32(work)]);
+    }
 
     qemu_spin_unlock(&cpu->neg.tlb.c.lock);
 
@@ -409,6 +446,103 @@ static void tlb_flush_by_mmuidx_async_work(CPUState *cpu, run_on_cpu_data data)
                         ctpop16(asked & ~to_clean));
         }
     }
+}
+
+/*
+ * iSH+: the guest switched address spaces (e.g. a new ASID): set the TLBs of
+ * @idxmap aside under @old_key and put back those set aside under @new_key
+ * (or start empty ones). Must be called on @cpu's own thread.
+ */
+void tlb_switch_context(CPUState *cpu, uint16_t idxmap,
+                        uint64_t old_key, uint64_t new_key)
+{
+    CPUTLB *tlb = &cpu->neg.tlb;
+    uint16_t work;
+
+    assert_cpu_is_self(cpu);
+    tcg_debug_assert(old_key && new_key);
+
+    qemu_spin_lock(&tlb->c.lock);
+    for (work = idxmap; work != 0; work &= work - 1) {
+        int mmu_idx = ctz32(work);
+        CPUTLBDesc *desc = &tlb->d[mmu_idx];
+        CPUTLBDescFast *fast = &tlb->f[mmu_idx];
+        CPUTLBStash *found = NULL, *slot = NULL;
+        size_t n = tlb_n_entries(fast);
+        bool have_table = true;
+
+        for (int i = 0; i < CPU_TLB_STASH; i++) {
+            if (desc->ishplus_stash[i].key == new_key) {
+                found = &desc->ishplus_stash[i];
+            }
+        }
+
+        /* Set the live TLB aside, if it has entries worth keeping */
+        if (desc->n_used_entries && n <= (1 << ISHPLUS_TLB_STASH_MAX_BITS)) {
+            for (int i = 0; i < CPU_TLB_STASH; i++) {
+                CPUTLBStash *st = &desc->ishplus_stash[i];
+
+                if (st == found) {
+                    continue;
+                }
+                if (!st->key) {
+                    slot = st;
+                    break;
+                }
+                if (!slot || st->lru < slot->lru) {
+                    slot = st;
+                }
+            }
+            if (slot) {
+                if (slot->key) {
+                    tlb_stash_free(slot);
+                }
+                slot->key = old_key;
+                slot->lru = ++desc->ishplus_lru;
+                slot->mask = fast->mask;
+                slot->table = fast->table;
+                slot->fulltlb = desc->fulltlb;
+                slot->large_page_addr = desc->large_page_addr;
+                slot->large_page_mask = desc->large_page_mask;
+                slot->n_used_entries = desc->n_used_entries;
+                have_table = false;
+            }
+        }
+
+        if (found) {
+            if (have_table) {
+                g_free(fast->table);
+                g_free(desc->fulltlb);
+            }
+            fast->mask = found->mask;
+            fast->table = found->table;
+            desc->fulltlb = found->fulltlb;
+            desc->large_page_addr = found->large_page_addr;
+            desc->large_page_mask = found->large_page_mask;
+            desc->n_used_entries = found->n_used_entries;
+            found->table = NULL;
+            found->fulltlb = NULL;
+            found->key = 0;
+        } else {
+            if (!have_table) {
+                fast->table = g_new(CPUTLBEntry, n);
+                desc->fulltlb = g_new(CPUTLBEntryFull, n);
+            }
+            memset(fast->table, -1, sizeof_tlb(fast));
+            desc->n_used_entries = 0;
+            desc->large_page_addr = -1;
+            desc->large_page_mask = -1;
+        }
+        tlb_block_cache_clear(desc);
+        desc->ishplus_evictions = 0;
+        desc->vindex = 0;
+        memset(desc->vtable, -1, sizeof(desc->vtable));
+        tlb->c.dirty |= 1 << mmu_idx;
+    }
+    qemu_spin_unlock(&tlb->c.lock);
+
+    /* Virtual addresses now mean other code */
+    tcg_flush_jmp_cache(cpu);
 }
 
 void tlb_flush_by_mmuidx(CPUState *cpu, uint16_t idxmap)
@@ -483,6 +617,25 @@ static inline bool tlb_flush_entry_locked(CPUTLBEntry *tlb_entry, vaddr page)
 }
 
 /* Called with tlb_c.lock held */
+/* iSH+: a page flush in a set-aside TLB (dropped if within its large pages) */
+static void tlb_flush_entry_in_stash(CPUTLBStash *st, vaddr page, vaddr mask)
+{
+    size_t n;
+
+    if (!st->key) {
+        return;
+    }
+    if ((page & st->large_page_mask) == st->large_page_addr) {
+        tlb_stash_free(st);
+        return;
+    }
+    n = (st->mask >> CPU_TLB_ENTRY_BITS) + 1;
+    if (tlb_flush_entry_mask_locked(&st->table[(page >> TARGET_PAGE_BITS) & (n - 1)],
+                                    page, mask)) {
+        st->n_used_entries--;
+    }
+}
+
 static void tlb_flush_vtlb_page_mask_locked(CPUState *cpu, int mmu_idx,
                                             vaddr page,
                                             vaddr mask)
@@ -510,6 +663,9 @@ static void tlb_flush_page_locked(CPUState *cpu, int midx, vaddr page)
     vaddr lp_mask = cpu->neg.tlb.d[midx].large_page_mask;
 
     tlb_block_cache_clear(&cpu->neg.tlb.d[midx]);
+    for (int i = 0; i < CPU_TLB_STASH; i++) {
+        tlb_flush_entry_in_stash(&cpu->neg.tlb.d[midx].ishplus_stash[i], page, -1);
+    }
 
     /* Check if we need to flush due to large pages.  */
     if ((page & lp_mask) == lp_addr) {
@@ -676,6 +832,21 @@ static void tlb_flush_range_locked(CPUState *cpu, int midx,
     vaddr mask = MAKE_64BIT_MASK(0, bits);
 
     tlb_block_cache_clear(d);
+    /* iSH+: the set-aside TLBs, page by page, or dropped like a full flush */
+    for (int i = 0; i < CPU_TLB_STASH; i++) {
+        CPUTLBStash *st = &d->ishplus_stash[i];
+
+        if (!st->key) {
+            continue;
+        }
+        if (mask < st->mask || len > st->mask) {
+            tlb_stash_free(st);
+            continue;
+        }
+        for (vaddr j = 0; j < len && st->key; j += TARGET_PAGE_SIZE) {
+            tlb_flush_entry_in_stash(st, addr + j, mask);
+        }
+    }
 
     /*
      * If @bits is smaller than the tlb size, there may be multiple entries
@@ -943,6 +1114,18 @@ void tlb_reset_dirty(CPUState *cpu, ram_addr_t start1, ram_addr_t length)
             tlb_reset_dirty_range_locked(&cpu->neg.tlb.d[mmu_idx].vtable[i],
                                          start1, length);
         }
+
+        /* iSH+: and in the TLBs set aside for other address spaces */
+        for (int s = 0; s < CPU_TLB_STASH; s++) {
+            CPUTLBStash *st = &cpu->neg.tlb.d[mmu_idx].ishplus_stash[s];
+
+            if (st->key && st->n_used_entries) {
+                n = (st->mask >> CPU_TLB_ENTRY_BITS) + 1;
+                for (i = 0; i < n; i++) {
+                    tlb_reset_dirty_range_locked(&st->table[i], start1, length);
+                }
+            }
+        }
     }
     qemu_spin_unlock(&cpu->neg.tlb.c.lock);
 }
@@ -1128,6 +1311,22 @@ void tlb_set_page_full(CPUState *cpu, int mmu_idx,
     /* Note that the tlb is no longer clean.  */
     tlb->c.dirty |= 1 << mmu_idx;
 
+    /*
+     * iSH+: QEMU resizes a TLB only when it is flushed, so a program that
+     * runs through more memory than the TLB covers without any flush (one
+     * process, no context switches) keeps missing. Once as many entries as
+     * the TLB holds have been evicted since it was last flushed or resized,
+     * flush it now so that the resize doubles it (up to
+     * ISHPLUS_TLB_GROW_MAX_BITS; shrinking at flushes still applies).
+     */
+    if (unlikely(desc->ishplus_evictions >= tlb_n_entries(&tlb->f[mmu_idx]) &&
+                 tlb_n_entries(&tlb->f[mmu_idx]) < (1 << ISHPLUS_TLB_GROW_MAX_BITS))) {
+        desc->window_max_entries = tlb_n_entries(&tlb->f[mmu_idx]);
+        tlb_flush_one_mmuidx_locked(cpu, mmu_idx, get_clock_realtime());
+        index = tlb_index(cpu, mmu_idx, addr_page);
+        te = tlb_entry(cpu, mmu_idx, addr_page);
+    }
+
     /* Make sure there's no cached translation for the new page.  */
     tlb_flush_vtlb_page_locked(cpu, mmu_idx, addr_page);
 
@@ -1143,6 +1342,7 @@ void tlb_set_page_full(CPUState *cpu, int mmu_idx,
         copy_tlb_helper_locked(tv, te);
         desc->vfulltlb[vidx] = desc->fulltlb[index];
         tlb_n_used_entries_dec(cpu, mmu_idx);
+        desc->ishplus_evictions++;
     }
 
     /* refill the tlb */

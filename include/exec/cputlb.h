@@ -176,6 +176,13 @@ void tlb_flush_page_by_mmuidx_all_cpus_synced(CPUState *cpu, vaddr addr,
  * Flush all entries from the TLB of the specified CPU, for the specified
  * MMU indexes.
  */
+/**
+ * tlb_switch_context: (iSH+) the guest switched address spaces: set the TLBs
+ * of @idxmap aside under @old_key and restore those set aside under
+ * @new_key, or start empty ones (keys non-zero). On @cpu's own thread.
+ */
+void tlb_switch_context(CPUState *cpu, uint16_t idxmap,
+                        uint64_t old_key, uint64_t new_key);
 void tlb_flush_by_mmuidx(CPUState *cpu, uint16_t idxmap);
 
 /**
@@ -247,6 +254,10 @@ static inline void tlb_flush_page_by_mmuidx(CPUState *cpu,
 {
 }
 
+static inline void tlb_switch_context(CPUState *cpu, uint16_t idxmap,
+                                      uint64_t old_key, uint64_t new_key)
+{
+}
 static inline void tlb_flush_by_mmuidx(CPUState *cpu, uint16_t idxmap)
 {
 }

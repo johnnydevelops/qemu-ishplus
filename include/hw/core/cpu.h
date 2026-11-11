@@ -276,6 +276,22 @@ struct CPUTLBEntryFull {
  * Data elements that are per MMU mode, minus the bits accessed by
  * the TCG fast path.
  */
+/*
+ * iSH+: a TLB set aside when the guest switched address spaces (ASID), to
+ * be put back when it switches back (tlb_switch_context).
+ */
+#define CPU_TLB_STASH 4
+typedef struct CPUTLBStash {
+    uint64_t key;                   /* 0: free */
+    uint64_t lru;
+    uintptr_t mask;                 /* CPUTLBDescFast.mask */
+    CPUTLBEntry *table;
+    CPUTLBEntryFull *fulltlb;
+    vaddr large_page_addr;
+    vaddr large_page_mask;
+    size_t n_used_entries;
+} CPUTLBStash;
+
 typedef struct CPUTLBDesc {
     /*
      * Describe a region covering all of the large pages allocated
@@ -301,6 +317,11 @@ typedef struct CPUTLBDesc {
      * phys_addr the block's base: pages of the block that miss in the TLB
      * are filled from it until this mmu_idx is flushed in any way.
      */
+    /* iSH+: the TLBs of other address spaces (tlb_switch_context) */
+    CPUTLBStash ishplus_stash[CPU_TLB_STASH];
+    uint64_t ishplus_lru;
+    /* iSH+: entries evicted since the last flush (cputlb grows the TLB) */
+    size_t ishplus_evictions;
     vaddr ishplus_block_addr;
     vaddr ishplus_block_mask;
     CPUTLBEntryFull ishplus_block_full;

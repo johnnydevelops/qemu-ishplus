@@ -4340,6 +4340,24 @@ static void vmsa_ttbr_write(CPUARMState *env, const ARMCPRegInfo *ri,
     if (cpreg_field_is_64bit(ri) &&
         extract64(raw_read(env, ri) ^ value, 48, 16) != 0) {
         ARMCPU *cpu = env_archcpu(env);
+#ifdef CONFIG_TCG
+        /*
+         * iSH+: the EL1&0 TLBs belong to the old ASID: set them aside and
+         * put back the new ASID's (Linux changes ASID at every process
+         * switch, and flushing them all made every switch refill the TLB).
+         * The other TLBs do not depend on this ASID; flushed as before.
+         */
+        if (tcg_enabled()) {
+            uint16_t e10 = ARMMMUIdxBit_E10_0 | ARMMMUIdxBit_E10_1 |
+                           ARMMMUIdxBit_E10_1_PAN;
+            uint64_t which = (uint64_t)(ri->opc2 & 1) << 16 | 1ull << 32;
+
+            tlb_switch_context(CPU(cpu), e10,
+                               which | extract64(raw_read(env, ri), 48, 16),
+                               which | extract64(value, 48, 16));
+            tlb_flush_by_mmuidx(CPU(cpu), ((1 << NB_MMU_MODES) - 1) & ~e10);
+        } else
+#endif
         tlb_flush(CPU(cpu));
     }
     raw_write(env, ri, value);
