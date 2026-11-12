@@ -310,6 +310,26 @@ static void tlbi_aa64_vmalle1is_write(CPUARMState *env, const ARMCPRegInfo *ri,
     tlb_flush_by_mmuidx_all_cpus_synced(cs, mask);
 }
 
+/* iSH+: TLBI ASIDE1{,IS,OS}: as VMALLE1, but the kernel's code stays cached */
+static void tlbi_aa64_aside1is_write(CPUARMState *env, const ARMCPRegInfo *ri,
+                                     uint64_t value)
+{
+    tlb_flush_asid_by_mmuidx_all_cpus_synced(env_cpu(env), vae1_tlbmask(env));
+}
+
+static void tlbi_aa64_aside1_write(CPUARMState *env, const ARMCPRegInfo *ri,
+                                   uint64_t value)
+{
+    CPUState *cs = env_cpu(env);
+    int mask = vae1_tlbmask(env);
+
+    if (tlb_force_broadcast(env)) {
+        tlb_flush_asid_by_mmuidx_all_cpus_synced(cs, mask);
+    } else {
+        tlb_flush_asid_by_mmuidx(cs, mask);
+    }
+}
+
 static void tlbi_aa64_vmalle1_write(CPUARMState *env, const ARMCPRegInfo *ri,
                                     uint64_t value)
 {
@@ -632,7 +652,7 @@ static const ARMCPRegInfo tlbi_v8_cp_reginfo[] = {
       .access = PL1_W, .accessfn = access_ttlbis,
       .type = ARM_CP_NO_RAW | ARM_CP_ADD_TLBI_NXS,
       .fgt = FGT_TLBIASIDE1IS,
-      .writefn = tlbi_aa64_vmalle1is_write },
+      .writefn = tlbi_aa64_aside1is_write },
     { .name = "TLBI_VAAE1IS", .state = ARM_CP_STATE_AA64,
       .opc0 = 1, .opc1 = 0, .crn = 8, .crm = 3, .opc2 = 3,
       .access = PL1_W, .accessfn = access_ttlbis,
@@ -668,7 +688,7 @@ static const ARMCPRegInfo tlbi_v8_cp_reginfo[] = {
       .access = PL1_W, .accessfn = access_ttlb,
       .type = ARM_CP_NO_RAW | ARM_CP_ADD_TLBI_NXS,
       .fgt = FGT_TLBIASIDE1,
-      .writefn = tlbi_aa64_vmalle1_write },
+      .writefn = tlbi_aa64_aside1_write },
     { .name = "TLBI_VAAE1", .state = ARM_CP_STATE_AA64,
       .opc0 = 1, .opc1 = 0, .crn = 8, .crm = 7, .opc2 = 3,
       .access = PL1_W, .accessfn = access_ttlb,
@@ -1159,7 +1179,7 @@ static const ARMCPRegInfo tlbios_reginfo[] = {
       .access = PL1_W, .accessfn = access_ttlbos,
       .type = ARM_CP_NO_RAW | ARM_CP_ADD_TLBI_NXS,
       .fgt = FGT_TLBIASIDE1OS,
-      .writefn = tlbi_aa64_vmalle1is_write },
+      .writefn = tlbi_aa64_aside1is_write },
     { .name = "TLBI_VAAE1OS", .state = ARM_CP_STATE_AA64,
       .opc0 = 1, .opc1 = 0, .crn = 8, .crm = 1, .opc2 = 3,
       .access = PL1_W, .accessfn = access_ttlbos,

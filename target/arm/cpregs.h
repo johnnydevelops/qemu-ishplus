@@ -1122,6 +1122,7 @@ void define_cortex_a72_a57_a53_cp_reginfo(ARMCPU *cpu);
 #endif
 
 CPAccessResult access_tvm_trvm(CPUARMState *, const ARMCPRegInfo *, bool);
+int arm_cpreg_ishplus_access(const ARMCPRegInfo *ri, int el, bool el2_el3);
 
 /**
  * arm_cpreg_trap_in_nv: Return true if cpreg traps in nested virtualization

@@ -5040,6 +5040,33 @@ static CPAccessResult access_nv1(CPUARMState *env, const ARMCPRegInfo *ri,
     return CP_ACCESS_OK;
 }
 
+/*
+ * iSH+: what @ri's access check comes to, known when translating, for the
+ * system registers Linux uses all the time (its current task in SP_EL0,
+ * exception entry and return, clearing pages): 1, it always allows access
+ * at @el; 2, only if PSTATE.SP (SP_EL0); 0, it must run. Without EL2 and
+ * EL3 (@el2_el3 false), HCR_EL2 and SCR_EL3 traps cannot happen.
+ */
+int arm_cpreg_ishplus_access(const ARMCPRegInfo *ri, int el, bool el2_el3)
+{
+    if (ri->accessfn == sp_el0_access) {
+        return 2;
+    }
+    if (ri->accessfn == aa64_daif_access) {
+        return el != 0;
+    }
+    if (el2_el3) {
+        return 0;
+    }
+    if (ri->accessfn == access_nv1 || ri->accessfn == access_tvm_trvm) {
+        return 1;
+    }
+    if (ri->accessfn == aa64_zva_access) {
+        return el == 1;
+    }
+    return 0;
+}
+
 #ifdef CONFIG_USER_ONLY
 /*
  * `IC IVAU` is handled to improve compatibility with JITs that dual-map their

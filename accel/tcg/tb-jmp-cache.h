@@ -41,6 +41,8 @@ typedef struct CPUJumpCache {
      */
     uint64_t stamp[2];
     uint32_t tag;
+    /* iSH+: and a generation of the lower half only (tcg_flush_jmp_cache_lower) */
+    uint64_t lgen;
     struct {
         TranslationBlock *tb;
         vaddr pc;
@@ -56,10 +58,11 @@ static inline uint64_t tb_jmp_cache_stamp(CPUJumpCache *jc, vaddr pc)
 /* After a change of gen or tag (on the vCPU's thread, or with all stopped) */
 static inline void tb_jmp_cache_restamp(CPUJumpCache *jc)
 {
-    uint64_t g = qatomic_read(&jc->gen) << 32;
+    uint64_t g = qatomic_read(&jc->gen);
 
-    qatomic_set(&jc->stamp[1], g);
-    qatomic_set(&jc->stamp[0], g | jc->tag);
+    qatomic_set(&jc->stamp[1], g << 32);
+    /* gen + lgen grows with either: each of its values is used once */
+    qatomic_set(&jc->stamp[0], (g + jc->lgen) << 32 | jc->tag);
 }
 
 #endif /* ACCEL_TCG_TB_JMP_CACHE_H */

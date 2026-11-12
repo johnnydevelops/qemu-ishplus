@@ -404,9 +404,13 @@ static void flush_all_helper(CPUState *src, run_on_cpu_func fn,
     }
 }
 
+/* iSH+: in the work's data: an ASID's invalidation (tlb_flush_asid_by_mmuidx) */
+#define ISHPLUS_FLUSH_ASID (1 << 16)
+
 static void tlb_flush_by_mmuidx_async_work(CPUState *cpu, run_on_cpu_data data)
 {
     uint16_t asked = data.host_int;
+    bool asid_only = data.host_int & ISHPLUS_FLUSH_ASID;
     uint16_t all_dirty, work, to_clean;
     int64_t now = get_clock_realtime();
 
@@ -437,7 +441,11 @@ static void tlb_flush_by_mmuidx_async_work(CPUState *cpu, run_on_cpu_data data)
      * (a TLB with none was flushed, with the jump cache, since).
      */
     if (to_clean) {
-        tcg_flush_jmp_cache(cpu);
+        if (asid_only) {
+            tcg_flush_jmp_cache_lower(cpu);
+        } else {
+            tcg_flush_jmp_cache(cpu);
+        }
     }
 
     if (to_clean == ALL_MMUIDX_BITS) {
@@ -573,6 +581,29 @@ void tlb_flush_by_mmuidx_all_cpus_synced(CPUState *src_cpu, uint16_t idxmap)
 
     flush_all_helper(src_cpu, fn, RUN_ON_CPU_HOST_INT(idxmap));
     async_safe_run_on_cpu(src_cpu, fn, RUN_ON_CPU_HOST_INT(idxmap));
+}
+
+/*
+ * iSH+: the guest invalidated an ASID's entries: the TLBs of @idxmap are
+ * flushed (QEMU's do not know which entries are global), but the jump
+ * cache only for the lower half of the address space, where the code of
+ * an ASID is (the kernel's is mapped global, and an ASID's invalidation
+ * leaves global entries).
+ */
+void tlb_flush_asid_by_mmuidx(CPUState *cpu, uint16_t idxmap)
+{
+    assert_cpu_is_self(cpu);
+    tlb_flush_by_mmuidx_async_work(cpu,
+                                   RUN_ON_CPU_HOST_INT(idxmap | ISHPLUS_FLUSH_ASID));
+}
+
+void tlb_flush_asid_by_mmuidx_all_cpus_synced(CPUState *src_cpu, uint16_t idxmap)
+{
+    const run_on_cpu_func fn = tlb_flush_by_mmuidx_async_work;
+    run_on_cpu_data d = RUN_ON_CPU_HOST_INT(idxmap | ISHPLUS_FLUSH_ASID);
+
+    flush_all_helper(src_cpu, fn, d);
+    async_safe_run_on_cpu(src_cpu, fn, d);
 }
 
 void tlb_flush_all_cpus_synced(CPUState *src_cpu)

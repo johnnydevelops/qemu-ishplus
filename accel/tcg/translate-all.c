@@ -679,6 +679,21 @@ void tcg_flush_jmp_cache(CPUState *cpu)
 }
 
 /*
+ * iSH+: empty the entries for the lower half of the address space (a
+ * process's code) only: what the guest invalidating an ASID's TLB entries
+ * changes (the kernel's are global, and stay).
+ */
+void tcg_flush_jmp_cache_lower(CPUState *cpu)
+{
+    CPUJumpCache *jc = cpu->tb_jmp_cache;
+
+    if (jc) {
+        jc->lgen++;
+        tb_jmp_cache_restamp(jc);
+    }
+}
+
+/*
  * iSH+: the guest switched to the address space @tag (non-zero): entries
  * for the lower half of the address space are now those made under @tag.
  */

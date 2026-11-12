@@ -2860,7 +2860,38 @@ static void handle_sys(DisasContext *s, bool isread,
         }
     }
 
-    if (ri->accessfn || (ri->fgt && s->fgt_active)) {
+    if (ri->accessfn && !(ri->fgt && s->fgt_active) &&
+        arm_cpreg_ishplus_access(ri, s->current_el,
+                                 arm_dc_feature(s, ARM_FEATURE_EL2) ||
+                                 arm_dc_feature(s, ARM_FEATURE_EL3)) == 1) {
+        /* iSH+: the check always allows access here */
+        if (ri->type & ARM_CP_RAISES_EXC) {
+            gen_a64_update_pc(s, 0);
+        }
+    } else if (ri->accessfn && !(ri->fgt && s->fgt_active) &&
+               arm_cpreg_ishplus_access(ri, s->current_el, true) == 2) {
+        /*
+         * iSH+: SP_EL0 is accessible unless it is the stack pointer
+         * (PSTATE.SP 0): the helper (to raise the exception) only then.
+         */
+        TCGLabel *ok = gen_new_label();
+        TCGv_i32 sp = tcg_temp_new_i32();
+        target_ulong pc_save = s->pc_save;
+
+        tcg_gen_ld_i32(sp, tcg_env, offsetof(CPUARMState, pstate));
+        tcg_gen_andi_i32(sp, sp, PSTATE_SP);
+        tcg_gen_brcondi_i32(TCG_COND_NE, sp, 0, ok);
+        gen_a64_update_pc(s, 0);
+        gen_helper_access_check_cp_reg(tcg_temp_new_ptr(), tcg_env,
+                                       tcg_constant_i32(key),
+                                       tcg_constant_i32(syndrome),
+                                       tcg_constant_i32(isread));
+        s->pc_save = pc_save;   /* (the pc is only updated on that way) */
+        gen_set_label(ok);
+        if (ri->type & ARM_CP_RAISES_EXC) {
+            gen_a64_update_pc(s, 0);
+        }
+    } else if (ri->accessfn || (ri->fgt && s->fgt_active)) {
         /* Emit code to perform further access permissions checks at
          * runtime; this may result in an exception.
          */

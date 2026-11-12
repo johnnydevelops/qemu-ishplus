@@ -183,6 +183,9 @@ void tlb_flush_page_by_mmuidx_all_cpus_synced(CPUState *cpu, vaddr addr,
  */
 void tlb_switch_context(CPUState *cpu, uint16_t idxmap,
                         uint64_t old_key, uint64_t new_key);
+/* iSH+: an ASID's invalidation (keeps the kernel's code in the jump cache) */
+void tlb_flush_asid_by_mmuidx(CPUState *cpu, uint16_t idxmap);
+void tlb_flush_asid_by_mmuidx_all_cpus_synced(CPUState *cpu, uint16_t idxmap);
 void tlb_flush_by_mmuidx(CPUState *cpu, uint16_t idxmap);
 
 /**
@@ -256,6 +259,13 @@ static inline void tlb_flush_page_by_mmuidx(CPUState *cpu,
 
 static inline void tlb_switch_context(CPUState *cpu, uint16_t idxmap,
                                       uint64_t old_key, uint64_t new_key)
+{
+}
+static inline void tlb_flush_asid_by_mmuidx(CPUState *cpu, uint16_t idxmap)
+{
+}
+static inline void tlb_flush_asid_by_mmuidx_all_cpus_synced(CPUState *cpu,
+                                                            uint16_t idxmap)
 {
 }
 static inline void tlb_flush_by_mmuidx(CPUState *cpu, uint16_t idxmap)
