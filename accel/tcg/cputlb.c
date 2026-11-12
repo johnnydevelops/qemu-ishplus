@@ -958,7 +958,15 @@ static void tlb_flush_range_by_mmuidx_async_0(CPUState *cpu,
      * iSH+: clearing it all is a new generation, so beyond 64 pages.
      */
     if (d.len >= TARGET_PAGE_SIZE * 64) {
-        tcg_flush_jmp_cache(cpu);
+        /*
+         * iSH+: a range in the lower half (a process's memory: its exit,
+         * munmap...) leaves the entries of the upper half (the kernel's code)
+         */
+        if (d.addr + d.len > d.addr && (int64_t)(d.addr + d.len - 1) >= 0) {
+            tcg_flush_jmp_cache_lower(cpu);
+        } else {
+            tcg_flush_jmp_cache(cpu);
+        }
         return;
     }
 

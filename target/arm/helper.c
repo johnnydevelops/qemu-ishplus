@@ -4348,7 +4348,10 @@ static void vmsa_ttbr_write(CPUARMState *env, const ARMCPRegInfo *ri,
          * iSH+: the EL1&0 TLBs belong to the old ASID: set them aside and
          * put back the new ASID's (Linux changes ASID at every process
          * switch, and flushing them all made every switch refill the TLB).
-         * The other TLBs do not depend on this ASID; flushed as before.
+         * The other TLBs do not depend on this ASID; flushed as before,
+         * except the physical ones (page table walks fill them, and
+         * flushing them, never empty, emptied the jump cache, the kernel's
+         * code included, at every process switch).
          */
         if (tcg_enabled()) {
             uint16_t e10 = ARMMMUIdxBit_E10_0 | ARMMMUIdxBit_E10_1 |
@@ -4358,7 +4361,14 @@ static void vmsa_ttbr_write(CPUARMState *env, const ARMCPRegInfo *ri,
             tlb_switch_context(CPU(cpu), e10,
                                which | extract64(raw_read(env, ri), 48, 16),
                                which | extract64(value, 48, 16));
-            tlb_flush_by_mmuidx(CPU(cpu), ((1 << NB_MMU_MODES) - 1) & ~e10);
+            uint16_t phys = 0;
+
+            for (int i = ARMMMUIdx_Phys_S; i <= ARMMMUIdx_Phys_Realm; i++) {
+                phys |= 1 << (i & ARM_MMU_IDX_COREIDX_MASK);
+            }
+
+            tlb_flush_by_mmuidx(CPU(cpu),
+                                ((1 << NB_MMU_MODES) - 1) & ~(e10 | phys));
         } else
 #endif
         tlb_flush(CPU(cpu));
