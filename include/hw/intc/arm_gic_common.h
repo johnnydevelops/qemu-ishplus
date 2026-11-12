@@ -140,6 +140,8 @@ struct GICState {
     MemoryRegion vcpuiomem; /* vCPU interface */
 
     uint32_t num_irq;
+    /* iSH+: 1 + the highest IRQ ever enabled (GIC_DIST_SET_ENABLED) */
+    uint32_t ishplus_irq_bound;
     uint32_t revision;
     bool security_extn;
     bool virt_extn;

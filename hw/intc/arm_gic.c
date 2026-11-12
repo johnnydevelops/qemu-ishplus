@@ -91,7 +91,8 @@ static inline void gic_get_best_irq(GICState *s, int cpu,
     *best_irq = 1023;
     *best_prio = 0x100;
 
-    for (irq = 0; irq < s->num_irq; irq++) {
+    /* iSH+: only up to the highest IRQ ever enabled (the others cannot be) */
+    for (irq = 0; irq < MIN(s->num_irq, s->ishplus_irq_bound); irq++) {
         if (GIC_DIST_TEST_ENABLED(irq, cm) && gic_test_pending(s, irq, cm) &&
             (!GIC_DIST_TEST_ACTIVE(irq, cm)) &&
             (irq < GIC_INTERNAL || GIC_DIST_TARGET(irq) & cm)) {

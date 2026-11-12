@@ -26,7 +26,10 @@
 
 #define ALL_CPU_MASK ((unsigned)(((1 << GIC_NCPU) - 1)))
 
-#define GIC_DIST_SET_ENABLED(irq, cm) (s->irq_state[irq].enabled |= (cm))
+/* iSH+: and the bound of the IRQs gic_get_best_irq scans (ishplus_irq_bound) */
+#define GIC_DIST_SET_ENABLED(irq, cm) \
+    (s->irq_state[irq].enabled |= (cm), \
+     s->ishplus_irq_bound = MAX(s->ishplus_irq_bound, (uint32_t)(irq) + 1))
 #define GIC_DIST_CLEAR_ENABLED(irq, cm) (s->irq_state[irq].enabled &= ~(cm))
 #define GIC_DIST_TEST_ENABLED(irq, cm) ((s->irq_state[irq].enabled & (cm)) != 0)
 #define GIC_DIST_SET_PENDING(irq, cm) (s->irq_state[irq].pending |= (cm))

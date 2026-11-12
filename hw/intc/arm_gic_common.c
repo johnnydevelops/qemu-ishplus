@@ -42,6 +42,8 @@ static int gic_pre_save(void *opaque)
 
 static int gic_post_load(void *opaque, int version_id)
 {
+    /* iSH+: enables restored without GIC_DIST_SET_ENABLED: scan them all */
+    ((GICState *)opaque)->ishplus_irq_bound = GIC_MAXIRQ;
     GICState *s = (GICState *)opaque;
     ARMGICCommonClass *c = ARM_GIC_COMMON_GET_CLASS(s);
 
