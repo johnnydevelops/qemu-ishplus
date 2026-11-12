@@ -90,6 +90,11 @@ struct TranslationBlock {
     /* size of target code for this block (1 <= size <= TARGET_PAGE_SIZE) */
     uint16_t size;
     uint16_t icount;
+    /*
+     * iSH+: guest code before pc the translation depends on (on the same
+     * page): changing it invalidates the TB too (tb-maint.c).
+     */
+    uint16_t ishplus_cover_lo;
 
     struct tb_tc tc;
 

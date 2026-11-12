@@ -134,6 +134,7 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
     db->pc_first = pc;
     db->pc_next = pc;
     db->ishplus_cover_end = 0;
+    db->ishplus_cover_start = 0;
     db->is_jmp = DISAS_NEXT;
     db->num_insns = 0;
     db->max_insns = *max_insns;
@@ -228,6 +229,11 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
     if (db->ishplus_cover_end > db->pc_next && !db->host_addr[1] &&
         ((db->ishplus_cover_end - 1) ^ db->pc_first) < TARGET_PAGE_SIZE) {
         tb->size = db->ishplus_cover_end - db->pc_first;
+    }
+    tb->ishplus_cover_lo = 0;
+    if (db->ishplus_cover_start && db->ishplus_cover_start < db->pc_first &&
+        ((db->ishplus_cover_start ^ db->pc_first) & TARGET_PAGE_MASK) == 0) {
+        tb->ishplus_cover_lo = db->pc_first - db->ishplus_cover_start;
     }
 
     if (plugin_enabled) {

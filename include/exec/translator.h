@@ -80,6 +80,7 @@ struct DisasContextBase {
      * pc_next (in the first page): the TB covers it, for invalidation.
      */
     vaddr ishplus_cover_end;
+    vaddr ishplus_cover_start;      /* and before pc_first (0: none) */
 
     /*
      * Record insn data that we cannot read directly from host memory.

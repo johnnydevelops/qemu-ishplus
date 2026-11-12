@@ -628,9 +628,9 @@ static void gen_a64_lookup_and_goto_ptr_flags(DisasContext *s, bool same_flags)
  * iSH+: dead flags at TB exits. QEMU computes all of N, Z, C and V for every
  * flag-setting insn, and must store them at the end of the TB, though the
  * code that follows usually sets them again before reading any (a loop's
- * cmp + b.cond). Where the guest code at a TB's exit, read ahead on the
- * TB's own page (which the TB then covers, so that changing that code
- * invalidates the TB), sets all four flags before reading any, they are
+ * cmp + b.cond). Where the guest code at a TB's exit, read on the TB's
+ * own page, before or after it (which the TB then covers, so that changing
+ * that code invalidates the TB), sets all four flags before reading any, they are
  * discarded and their computations dropped. Only exceptions and interrupts
  * taken in between see their stale values (and they restore them as they
  * were, still dead).
@@ -681,7 +681,7 @@ static bool ishplus_flags_dead_at(DisasContext *s, vaddr dest)
     vaddr first = s->base.pc_first;
 
     if (!s->base.host_addr[0] || s->base.host_addr[1] || s->ss_active ||
-        dest < first || ((dest ^ first) & TARGET_PAGE_MASK)) {
+        ((dest ^ first) & TARGET_PAGE_MASK)) {
         return false;
     }
     for (int i = 0; i < 16; i++) {
@@ -692,7 +692,12 @@ static bool ishplus_flags_dead_at(DisasContext *s, vaddr dest)
         }
         switch (ishplus_insn_flags(ldl_le_p(s->base.host_addr[0] + (a - first)))) {
         case FL_WRITE:
+            /* The TB covers what was read (before or after it) */
             s->base.ishplus_cover_end = MAX(s->base.ishplus_cover_end, a + 4);
+            if (dest < first && (!s->base.ishplus_cover_start ||
+                                 dest < s->base.ishplus_cover_start)) {
+                s->base.ishplus_cover_start = dest;
+            }
             return true;
         case FL_NEUTRAL:
             continue;

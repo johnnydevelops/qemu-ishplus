@@ -1133,6 +1133,8 @@ tb_invalidate_phys_page_range__locked(struct page_collection *pages,
         tb_last = tb_start + tb->size - 1;
         if (n == 0) {
             tb_last = MIN(tb_last, tb_start | ~TARGET_PAGE_MASK);
+            /* iSH+: and the code before it that it was translated for */
+            tb_start -= tb->ishplus_cover_lo;
         } else {
             tb_start = tb_page_addr1(tb);
             tb_last = tb_start + (tb_last & ~TARGET_PAGE_MASK);
