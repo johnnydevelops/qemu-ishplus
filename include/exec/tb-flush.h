@@ -25,4 +25,7 @@ void tb_flush(CPUState *cs);
 
 void tcg_flush_jmp_cache(CPUState *cs);
 
+/* iSH+: the guest switched address spaces (see CPUJumpCache.stamp) */
+void tb_jmp_cache_set_tag(CPUState *cpu, uint32_t tag);
+
 #endif /* _TB_FLUSH_H_ */

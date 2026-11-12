@@ -893,10 +893,13 @@ static void tb_jmp_cache_inval_tb(TranslationBlock *tb)
     CPUState *cpu;
 
     if (tb_cflags(tb) & CF_PCREL) {
-        /* A TB may be at any virtual address */
-        CPU_FOREACH(cpu) {
-            tcg_flush_jmp_cache(cpu);
-        }
+        /*
+         * A TB may be at any virtual address. iSH+: but not flushed: every
+         * lookup of the jump cache compares the TB's cflags, which are now
+         * CF_INVALID (and invalid TBs stay in memory until tb_flush, which
+         * empties the caches). Emptying every vCPU's cache at each
+         * invalidation made them miss most of the time.
+         */
     } else {
         uint32_t h = tb_jmp_cache_hash_func(tb->pc);
 

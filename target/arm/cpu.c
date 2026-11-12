@@ -1966,6 +1966,12 @@ void arm_cpu_finalize_features(ARMCPU *cpu, Error **errp)
             error_propagate(errp, local_err);
             return;
         }
+
+        /* iSH+: bti=off (-cpu max only has the property) */
+        if (object_property_find(OBJECT(cpu), "bti") && !cpu->prop_bti) {
+            cpu->isar.id_aa64pfr1 = FIELD_DP64(cpu->isar.id_aa64pfr1,
+                                               ID_AA64PFR1, BT, 0);
+        }
     }
 #endif
 

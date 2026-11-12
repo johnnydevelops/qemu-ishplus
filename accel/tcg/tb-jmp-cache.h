@@ -32,11 +32,34 @@ typedef struct CPUJumpCache {
     struct rcu_head rcu;
     /* iSH+: entries of other generations are empty (tcg_flush_jmp_cache) */
     uint64_t gen;
+    /*
+     * iSH+: what valid entries hold in .gen: the generation (high half),
+     * and for the lower half of the address space (a process's code) the
+     * address space's tag (low half, tb_jmp_cache_set_tag): a guest
+     * process switch changes the tag, not the generation, and switching
+     * back finds that process's entries again. [0] lower, [1] upper half.
+     */
+    uint64_t stamp[2];
+    uint32_t tag;
     struct {
         TranslationBlock *tb;
         vaddr pc;
         uint64_t gen;
     } array[TB_JMP_CACHE_SIZE];
 } CPUJumpCache;
+
+static inline uint64_t tb_jmp_cache_stamp(CPUJumpCache *jc, vaddr pc)
+{
+    return qatomic_read(&jc->stamp[(int64_t)pc < 0]);
+}
+
+/* After a change of gen or tag (on the vCPU's thread, or with all stopped) */
+static inline void tb_jmp_cache_restamp(CPUJumpCache *jc)
+{
+    uint64_t g = qatomic_read(&jc->gen) << 32;
+
+    qatomic_set(&jc->stamp[1], g);
+    qatomic_set(&jc->stamp[0], g | jc->tag);
+}
 
 #endif /* ACCEL_TCG_TB_JMP_CACHE_H */

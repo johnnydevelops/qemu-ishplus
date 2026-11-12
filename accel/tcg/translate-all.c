@@ -675,4 +675,19 @@ void tcg_flush_jmp_cache(CPUState *cpu)
 
     /* iSH+: a new generation empties every entry at once */
     qatomic_inc(&jc->gen);
+    tb_jmp_cache_restamp(jc);
+}
+
+/*
+ * iSH+: the guest switched to the address space @tag (non-zero): entries
+ * for the lower half of the address space are now those made under @tag.
+ */
+void tb_jmp_cache_set_tag(CPUState *cpu, uint32_t tag)
+{
+    CPUJumpCache *jc = cpu->tb_jmp_cache;
+
+    if (jc) {
+        jc->tag = tag;
+        tb_jmp_cache_restamp(jc);
+    }
 }

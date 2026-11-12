@@ -490,10 +490,21 @@ static inline bool use_goto_tb(DisasContext *s, uint64_t dest)
  * else (a miss, single-step, breakpoints, special compile flags) takes the
  * helper as before.
  */
+/*
+ * @same_flags: the exit of a branch to a register (DISAS_JUMP), which cannot
+ * have changed hflags: the next TB's flags are this TB's (but BTYPE), and
+ * are compared as constants.
+ */
+static void gen_a64_lookup_and_goto_ptr_flags(DisasContext *s, bool same_flags);
+
 static void gen_a64_lookup_and_goto_ptr(DisasContext *s)
 {
+    gen_a64_lookup_and_goto_ptr_flags(s, false);
+}
+
+static void gen_a64_lookup_and_goto_ptr_flags(DisasContext *s, bool same_flags)
+{
     uint32_t cflags = tcg_ctx->gen_tb->cflags & ~CF_INVALID;
-    const int shift = TARGET_PAGE_BITS - TB_JMP_PAGE_BITS;
     TCGLabel *slow;
     TCGv_i64 pc, t, h, a, b;
     TCGv_i32 a32, b32;
@@ -518,11 +529,19 @@ static void gen_a64_lookup_and_goto_ptr(DisasContext *s)
 
     /* tb_jmp_cache_hash_func(pc) */
     tcg_gen_mov_i64(pc, cpu_pc);
-    tcg_gen_shri_i64(t, pc, shift);
-    tcg_gen_xor_i64(t, t, pc);
-    tcg_gen_shri_i64(h, t, shift);
-    tcg_gen_andi_i64(h, h, TB_JMP_PAGE_MASK);
-    tcg_gen_andi_i64(t, t, TB_JMP_ADDR_MASK);
+    tcg_gen_shri_i64(t, pc, TARGET_PAGE_BITS);              /* page */
+    tcg_gen_shri_i64(h, t, TB_JMP_GROUP_BITS);
+    tcg_gen_xor_i64(h, h, t);
+    tcg_gen_shri_i64(t, t, 2 * TB_JMP_GROUP_BITS);
+    tcg_gen_xor_i64(h, h, t);
+    tcg_gen_shli_i64(h, h, TB_JMP_PAGE_BITS);
+    tcg_gen_andi_i64(h, h, TB_JMP_PAGE_MASK);               /* group */
+    tcg_gen_shri_i64(t, pc, 2);
+    tcg_gen_shri_i64(a, pc, 2 + TB_JMP_PAGE_BITS);
+    tcg_gen_xor_i64(t, t, a);
+    tcg_gen_shri_i64(a, pc, TARGET_PAGE_BITS + TB_JMP_GROUP_BITS);
+    tcg_gen_xor_i64(t, t, a);
+    tcg_gen_andi_i64(t, t, TB_JMP_ADDR_MASK);               /* entry */
     tcg_gen_or_i64(h, h, t);
     tcg_gen_muli_i64(h, h, sizeof(((CPUJumpCache *)0)->array[0]));
 
@@ -531,13 +550,50 @@ static void gen_a64_lookup_and_goto_ptr(DisasContext *s)
                    offsetof(ArchCPU, env));
     tcg_gen_trunc_i64_ptr(e, h);
     tcg_gen_add_ptr(e, e, jc);
-    tcg_gen_ld_i64(a, jc, offsetof(CPUJumpCache, gen));
+    /*
+     * The stamp of entries in this half of the address space: EL0 code's
+     * branches stay in the lower half, EL1's in the upper (an entry for
+     * the other half then misses, harmlessly).
+     */
+    tcg_gen_ld_i64(a, jc, offsetof(CPUJumpCache, stamp[s->current_el != 0]));
     tcg_gen_ld_i64(b, e, offsetof(CPUJumpCache, array[0].gen));
     tcg_gen_brcond_i64(TCG_COND_NE, a, b, slow);
     tcg_gen_ld_i64(b, e, offsetof(CPUJumpCache, array[0].pc));
     tcg_gen_brcond_i64(TCG_COND_NE, b, pc, slow);
     tcg_gen_ld_ptr(tb, e, offsetof(CPUJumpCache, array[0].tb));
     tcg_gen_brcondi_ptr(TCG_COND_EQ, tb, 0, slow);
+
+    if (same_flags && !EX_TBFLAG_ANY(((CPUARMTBFlags){ s->base.tb->flags }),
+                                     SS_ACTIVE)) {
+        /* flags and cflags (adjacent), then cs_base (flags2, with BTYPE) */
+        uint64_t f2 = s->base.tb->cs_base;
+
+        QEMU_BUILD_BUG_ON(offsetof(TranslationBlock, cflags) !=
+                          offsetof(TranslationBlock, flags) + 4);
+        tcg_gen_ld_i64(b, tb, offsetof(TranslationBlock, flags));
+        tcg_gen_brcondi_i64(TCG_COND_NE, b,
+                            (uint64_t)cflags << 32 | s->base.tb->flags, slow);
+        tcg_gen_ld_i64(b, tb, offsetof(TranslationBlock, cs_base));
+        if (dc_isar_feature(aa64_bti, s)) {
+            f2 &= ~(uint64_t)R_TBFLAG_A64_BTYPE_MASK;
+            tcg_gen_ld32u_i64(t, tcg_env, offsetof(CPUARMState, btype));
+            tcg_gen_shli_i64(t, t, R_TBFLAG_A64_BTYPE_SHIFT);
+            tcg_gen_ori_i64(a, t, f2);
+            tcg_gen_brcond_i64(TCG_COND_NE, a, b, slow);
+        } else {
+            tcg_gen_brcondi_i64(TCG_COND_NE, b, f2, slow);
+        }
+        /* check_for_breakpoints() only matters with breakpoints */
+        tcg_gen_ld_ptr(e, tcg_env, offsetof(ArchCPU, parent_obj.breakpoints.tqh_first) -
+                       offsetof(ArchCPU, env));
+        tcg_gen_brcondi_ptr(TCG_COND_NE, e, 0, slow);
+        tcg_gen_ld_ptr(e, tb, offsetof(TranslationBlock, tc.ptr));
+        tcg_gen_goto_ptr(e);
+
+        gen_set_label(slow);
+        tcg_gen_lookup_and_goto_ptr();
+        return;
+    }
 
     /* cpu_get_tb_cpu_state(): hflags, with BTYPE; not with single-step */
     tcg_gen_ld_i32(a32, tcg_env, offsetof(CPUARMState, hflags.flags));
@@ -10897,7 +10953,7 @@ static void aarch64_tr_tb_stop(DisasContextBase *dcbase, CPUState *cpu)
             gen_a64_update_pc(dc, 4);
             /* fall through */
         case DISAS_JUMP:
-            gen_a64_lookup_and_goto_ptr(dc);
+            gen_a64_lookup_and_goto_ptr_flags(dc, true);
             break;
         case DISAS_NORETURN:
         case DISAS_SWI:

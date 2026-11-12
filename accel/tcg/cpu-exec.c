@@ -248,7 +248,7 @@ static inline TranslationBlock *tb_lookup(CPUState *cpu, vaddr pc,
     tb = qatomic_read(&jc->array[hash].tb);
     if (likely(tb &&
                jc->array[hash].pc == pc &&
-               jc->array[hash].gen == qatomic_read(&jc->gen) &&
+               jc->array[hash].gen == tb_jmp_cache_stamp(jc, pc) &&
                tb->cs_base == cs_base &&
                tb->flags == flags &&
                tb_cflags(tb) == cflags)) {
@@ -261,7 +261,7 @@ static inline TranslationBlock *tb_lookup(CPUState *cpu, vaddr pc,
     }
 
     jc->array[hash].pc = pc;
-    jc->array[hash].gen = qatomic_read(&jc->gen);
+    jc->array[hash].gen = tb_jmp_cache_stamp(jc, pc);
     qatomic_set(&jc->array[hash].tb, tb);
 
 hit:
@@ -997,7 +997,7 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
                 h = tb_jmp_cache_hash_func(pc);
                 jc = cpu->tb_jmp_cache;
                 jc->array[h].pc = pc;
-                jc->array[h].gen = qatomic_read(&jc->gen);
+                jc->array[h].gen = tb_jmp_cache_stamp(jc, pc);
                 qatomic_set(&jc->array[h].tb, tb);
             }
 
@@ -1084,6 +1084,7 @@ bool tcg_exec_realizefn(CPUState *cpu, Error **errp)
 
     cpu->tb_jmp_cache = g_new0(CPUJumpCache, 1);
     cpu->tb_jmp_cache->gen = 1;
+    tb_jmp_cache_restamp(cpu->tb_jmp_cache);
     tlb_init(cpu);
 #ifndef CONFIG_USER_ONLY
     tcg_iommu_init_notifier_list(cpu);

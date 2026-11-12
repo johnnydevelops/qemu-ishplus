@@ -432,7 +432,13 @@ static void tlb_flush_by_mmuidx_async_work(CPUState *cpu, run_on_cpu_data data)
 
     qemu_spin_unlock(&cpu->neg.tlb.c.lock);
 
-    tcg_flush_jmp_cache(cpu);
+    /*
+     * iSH+: only if a TLB had entries: code is only looked up through them
+     * (a TLB with none was flushed, with the jump cache, since).
+     */
+    if (to_clean) {
+        tcg_flush_jmp_cache(cpu);
+    }
 
     if (to_clean == ALL_MMUIDX_BITS) {
         qatomic_set(&cpu->neg.tlb.c.full_flush_count,
@@ -541,8 +547,8 @@ void tlb_switch_context(CPUState *cpu, uint16_t idxmap,
     }
     qemu_spin_unlock(&tlb->c.lock);
 
-    /* Virtual addresses now mean other code */
-    tcg_flush_jmp_cache(cpu);
+    /* Virtual addresses now mean other code: that of @new_key's entries */
+    tb_jmp_cache_set_tag(cpu, 0x80000000u | (uint32_t)new_key);
 }
 
 void tlb_flush_by_mmuidx(CPUState *cpu, uint16_t idxmap)

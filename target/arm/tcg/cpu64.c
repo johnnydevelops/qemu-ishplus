@@ -200,6 +200,14 @@ static void cpu_max_get_l0gptsz(Object *obj, Visitor *v, const char *name,
 
 static const Property arm_cpu_lpa2_property =
     DEFINE_PROP_BOOL("lpa2", ARMCPU, prop_lpa2, true);
+/*
+ * iSH+: bti=off leaves out FEAT_BTI, for guests that do not use it: QEMU
+ * otherwise translates code apart for each BTYPE it is reached with (a
+ * function called and returned to), and those copies evict each other
+ * from the jump cache.
+ */
+static const Property arm_cpu_bti_property =
+    DEFINE_PROP_BOOL("bti", ARMCPU, prop_bti, true);
 
 static void aarch64_a55_initfn(Object *obj)
 {
@@ -1297,6 +1305,7 @@ void aarch64_max_tcg_initfn(Object *obj)
     object_property_add(obj, "x-l0gptsz", "uint32", cpu_max_get_l0gptsz,
                         cpu_max_set_l0gptsz, NULL, NULL);
     qdev_property_add_static(DEVICE(obj), &arm_cpu_lpa2_property);
+    qdev_property_add_static(DEVICE(obj), &arm_cpu_bti_property);
 }
 
 static const ARMCPUInfo aarch64_cpus[] = {

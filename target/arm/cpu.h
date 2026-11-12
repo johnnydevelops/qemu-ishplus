@@ -869,6 +869,14 @@ struct ArchCPU {
 
     /* Coprocessor information */
     GHashTable *cp_regs;
+    /*
+     * iSH+: the last registers looked up by key at run time (op_helper.c):
+     * cp_regs does not change once the CPU is realized.
+     */
+    struct {
+        uint32_t key;
+        const struct ARMCPRegInfo *ri;
+    } ishplus_cpreg_cache[64];
     /* For marshalling (mostly coprocessor) register state between the
      * kernel and QEMU (for KVM) and between two QEMUs (for migration),
      * we use these arrays.
@@ -1103,6 +1111,8 @@ struct ArchCPU {
     bool prop_pauth_qarma3;
     bool prop_pauth_qarma5;
     bool prop_lpa2;
+    /* iSH+: "bti": FEAT_BTI on -cpu max (off: BTYPE is no part of TB flags) */
+    bool prop_bti;
 
     /* DCZ blocksize, in log_2(words), ie low 4 bits of DCZID_EL0 */
     uint8_t dcz_blocksize;

@@ -28,29 +28,34 @@
 
 #ifdef CONFIG_SOFTMMU
 
-/* Only the bottom TB_JMP_PAGE_BITS of the jump cache hash bits vary for
-   addresses on the same page.  The top bits are the same.  This allows
-   TLB invalidation to quickly clear a subset of the hash table.  */
-/* iSH+: 64 entries per page as with QEMU's 4K cache, so clearing a page's
-   entries stays cheap with a bigger cache (more pages instead) */
-#define TB_JMP_PAGE_BITS 6
+/*
+ * In softmmu, the jump cache is split in groups, one per page (and other
+ * pages hashing to it): a TLB page flush clears the page's group.
+ * iSH+: 256 groups of 256 entries. With 64 entries a group, the TBs of
+ * one page evicted each other: most misses were such collisions. The
+ * entry within the group mixes the insn's offset with higher bits.
+ */
+#define TB_JMP_PAGE_BITS 8
 #define TB_JMP_PAGE_SIZE (1 << TB_JMP_PAGE_BITS)
 #define TB_JMP_ADDR_MASK (TB_JMP_PAGE_SIZE - 1)
+#define TB_JMP_GROUP_BITS (TB_JMP_CACHE_BITS - TB_JMP_PAGE_BITS)
 #define TB_JMP_PAGE_MASK (TB_JMP_CACHE_SIZE - TB_JMP_PAGE_SIZE)
 
+/* The group of the page of @pc (from its page number only) */
 static inline unsigned int tb_jmp_cache_hash_page(vaddr pc)
 {
-    vaddr tmp;
-    tmp = pc ^ (pc >> (TARGET_PAGE_BITS - TB_JMP_PAGE_BITS));
-    return (tmp >> (TARGET_PAGE_BITS - TB_JMP_PAGE_BITS)) & TB_JMP_PAGE_MASK;
+    vaddr page = pc >> TARGET_PAGE_BITS;
+
+    page ^= (page >> TB_JMP_GROUP_BITS) ^ (page >> (2 * TB_JMP_GROUP_BITS));
+    return (page << TB_JMP_PAGE_BITS) & TB_JMP_PAGE_MASK;
 }
 
 static inline unsigned int tb_jmp_cache_hash_func(vaddr pc)
 {
-    vaddr tmp;
-    tmp = pc ^ (pc >> (TARGET_PAGE_BITS - TB_JMP_PAGE_BITS));
-    return (((tmp >> (TARGET_PAGE_BITS - TB_JMP_PAGE_BITS)) & TB_JMP_PAGE_MASK)
-           | (tmp & TB_JMP_ADDR_MASK));
+    vaddr e = (pc >> 2) ^ (pc >> (2 + TB_JMP_PAGE_BITS)) ^
+              (pc >> (TARGET_PAGE_BITS + TB_JMP_GROUP_BITS));
+
+    return tb_jmp_cache_hash_page(pc) | (e & TB_JMP_ADDR_MASK);
 }
 
 #else
