@@ -163,6 +163,15 @@ typedef struct DisasContext {
     bool fpcr_ah;
     /* iSH+: FPCR is all default: floating point as host instructions */
     bool fp_native;
+    /*
+     * iSH+: the values of vector registers that native FP instructions
+     * computed or loaded, kept in host registers (env is still written:
+     * these only save reloading it). native_sync forgets those the ops
+     * emitted since native_scan may have changed.
+     */
+    TCGOp *native_scan;
+    TCGv_vec native_val[32];
+    TCGType native_type[32];
     /* True if FPCR.NEP is 1 (FEAT_AFP scalar upper-element result handling) */
     bool fpcr_nep;
     /*

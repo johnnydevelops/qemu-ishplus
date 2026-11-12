@@ -1719,6 +1719,16 @@ static bool tcg_out_qemu_ld_slow_path(TCGContext *s, TCGLabelQemuLdst *lb)
         return false;
     }
 
+    if (lb->type == TCG_TYPE_V128) {
+        /* iSH+: aa64_qemu_ld_v128: the 16 bytes (x0, x1) into the vector */
+        tcg_out_ld_helper_args(s, lb, &ldst_helper_param);
+        tcg_out_call_int(s, qemu_ld_helpers[MO_128]);
+        tcg_out32(s, 0x9e670000 | TCG_REG_X0 << 5 | (lb->datalo_reg & 31));
+        tcg_out32(s, 0x4e181c00 | TCG_REG_X1 << 5 | (lb->datalo_reg & 31));
+        tcg_out_goto(s, lb->raddr);
+        return true;
+    }
+
     tcg_out_ld_helper_args(s, lb, &ldst_helper_param);
     tcg_out_call_int(s, qemu_ld_helpers[opc & MO_SIZE]);
     tcg_out_ld_helper_ret(s, lb, false, &ldst_helper_param);
@@ -1732,6 +1742,21 @@ static bool tcg_out_qemu_st_slow_path(TCGContext *s, TCGLabelQemuLdst *lb)
 
     if (!reloc_pc19(lb->label_ptr[0], tcg_splitwx_to_rx(s->code_ptr))) {
         return false;
+    }
+
+    if (lb->type == TCG_TYPE_V128) {
+        /* iSH+: aa64_qemu_st_v128: the vector's halves as an Int128 */
+        TCGLabelQemuLdst l = *lb;
+
+        tcg_out32(s, 0x9e660000 | (lb->datalo_reg & 31) << 5 | TCG_REG_TMP1);
+        tcg_out32(s, 0x4e183c00 | (lb->datalo_reg & 31) << 5 | TCG_REG_TMP2);
+        l.type = TCG_TYPE_I128;
+        l.datalo_reg = TCG_REG_TMP1;
+        l.datahi_reg = TCG_REG_TMP2;
+        tcg_out_st_helper_args(s, &l, &ldst_helper_param);
+        tcg_out_call_int(s, qemu_st_helpers[MO_128]);
+        tcg_out_goto(s, lb->raddr);
+        return true;
     }
 
     tcg_out_st_helper_args(s, lb, &ldst_helper_param);
@@ -1942,6 +1967,42 @@ static void tcg_out_qemu_st(TCGContext *s, TCGReg data_reg, TCGReg addr_reg,
     if (ldst) {
         ldst->type = data_type;
         ldst->datalo_reg = data_reg;
+        ldst->raddr = tcg_splitwx_to_rx(s->code_ptr);
+    }
+}
+
+/*
+ * iSH+: aa64_qemu_ld_v128 / aa64_qemu_st_v128, a 128-bit guest load into, or
+ * store from, vector @vreg
+ */
+static void tcg_out_qemu_ldst_v128(TCGContext *s, TCGReg vreg, TCGReg addr_reg,
+                                   MemOpIdx oi, bool is_ld)
+{
+    TCGLabelQemuLdst *ldst;
+    HostAddress h;
+    TCGReg base;
+
+    ldst = prepare_host_addr(s, &h, addr_reg, oi, is_ld);
+    /* Only emitted with LSE2 (as qemu_ld_i128): LDR Q is then atomic enough */
+    tcg_debug_assert(have_lse2);
+
+    if (h.index == TCG_REG_XZR) {
+        base = h.base;
+    } else {
+        base = TCG_REG_TMP2;
+        if (h.index_ext == TCG_TYPE_I32) {
+            tcg_out_insn(s, 3501, ADD, TCG_TYPE_I64, base,
+                         h.base, h.index, MO_32, 0);
+        } else {
+            tcg_out_insn(s, 3502, ADD, 1, base, h.base, h.index);
+        }
+    }
+    /* ldr/str q(vreg), [base] */
+    tcg_out32(s, (is_ld ? 0x3dc00000 : 0x3d800000) | (base & 31) << 5 | (vreg & 31));
+
+    if (ldst) {
+        ldst->type = TCG_TYPE_V128;
+        ldst->datalo_reg = vreg;
         ldst->raddr = tcg_splitwx_to_rx(s->code_ptr);
     }
 }
@@ -2735,6 +2796,7 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
     case INDEX_op_aa64_fmaxnm_vec:
     case INDEX_op_aa64_fminnm_vec:
     case INDEX_op_aa64_fabd_vec:
+    case INDEX_op_aa64_fnmul_vec:   /* scalar only */
         {
             static const uint32_t vec_insn[] = {
                 [INDEX_op_aa64_fadd_vec - INDEX_op_aa64_fadd_vec] = 0x4e20d400,
@@ -2746,6 +2808,7 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
                 [INDEX_op_aa64_fmaxnm_vec - INDEX_op_aa64_fadd_vec] = 0x4e20c400,
                 [INDEX_op_aa64_fminnm_vec - INDEX_op_aa64_fadd_vec] = 0x4ea0c400,
                 [INDEX_op_aa64_fabd_vec - INDEX_op_aa64_fadd_vec] = 0x6ea0d400,
+                [INDEX_op_aa64_fnmul_vec - INDEX_op_aa64_fadd_vec] = 0,
             };
             static const uint32_t scalar_insn[] = {
                 [INDEX_op_aa64_fadd_vec - INDEX_op_aa64_fadd_vec] = 0x1e202800,
@@ -2757,14 +2820,22 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
                 [INDEX_op_aa64_fmaxnm_vec - INDEX_op_aa64_fadd_vec] = 0x1e206800,
                 [INDEX_op_aa64_fminnm_vec - INDEX_op_aa64_fadd_vec] = 0x1e207800,
                 [INDEX_op_aa64_fabd_vec - INDEX_op_aa64_fadd_vec] = 0x7ea0d400,
+                [INDEX_op_aa64_fnmul_vec - INDEX_op_aa64_fadd_vec] = 0x1e208800,
             };
             unsigned i = opc - INDEX_op_aa64_fadd_vec;
             uint32_t insn = is_q ? vec_insn[i] : scalar_insn[i];
 
+            tcg_debug_assert(insn);
             tcg_debug_assert(vece == MO_32 || vece == MO_64);
             tcg_out32(s, insn | (vece == MO_64) << 22 | (a2 & 31) << 16 |
                       (a1 & 31) << 5 | (a0 & 31));
         }
+        break;
+    case INDEX_op_aa64_qemu_ld_v128:
+        tcg_out_qemu_ldst_v128(s, a0, a1, a2, true);
+        break;
+    case INDEX_op_aa64_qemu_st_v128:
+        tcg_out_qemu_ldst_v128(s, a0, a1, a2, false);
         break;
     case INDEX_op_aa64_fsqrt_vec:
         tcg_debug_assert(vece == MO_32 || vece == MO_64);
@@ -3221,9 +3292,14 @@ tcg_target_op_def(TCGOpcode op, TCGType type, unsigned flags)
     case INDEX_op_aa64_fmaxnm_vec:
     case INDEX_op_aa64_fminnm_vec:
     case INDEX_op_aa64_fabd_vec:
+    case INDEX_op_aa64_fnmul_vec:
         return C_O1_I2(w, w, w);
     case INDEX_op_aa64_fsqrt_vec:
         return C_O1_I1(w, w);
+    case INDEX_op_aa64_qemu_ld_v128:
+        return C_O1_I1(w, r);
+    case INDEX_op_aa64_qemu_st_v128:
+        return C_O0_I2(w, r);
     case INDEX_op_aa64_fmla_vec:
     case INDEX_op_aa64_fmls_vec:
     case INDEX_op_aa64_fnmla_vec:

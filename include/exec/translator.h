@@ -75,6 +75,11 @@ struct DisasContextBase {
     bool fake_insn;
     struct TCGOp *insn_start;
     void *host_addr[2];
+    /*
+     * iSH+: the end of guest code the translation depends on beyond
+     * pc_next (in the first page): the TB covers it, for invalidation.
+     */
+    vaddr ishplus_cover_end;
 
     /*
      * Record insn data that we cannot read directly from host memory.

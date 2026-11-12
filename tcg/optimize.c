@@ -3024,6 +3024,9 @@ void tcg_optimize(TCGContext *s)
             }
             QEMU_FALLTHROUGH;
         case INDEX_op_qemu_ld_i128:
+#ifdef TCG_TARGET_ISHPLUS_NATIVE_FP
+        case INDEX_op_aa64_qemu_ld_v128:
+#endif
             done = fold_qemu_ld_2reg(&ctx, op);
             break;
         case INDEX_op_qemu_st8_i32:
@@ -3084,6 +3087,11 @@ void tcg_optimize(TCGContext *s)
             finish_ebb(&ctx);
             done = true;
             break;
+#ifdef TCG_TARGET_ISHPLUS_NATIVE_FP
+        case INDEX_op_aa64_qemu_st_v128:
+            done = fold_qemu_st(&ctx, op);
+            break;
+#endif
         default:
             done = finish_folding(&ctx, op);
             break;

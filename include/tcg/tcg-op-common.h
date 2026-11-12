@@ -441,6 +441,11 @@ void tcg_gen_ishplus_fp_vec3(TCGOpcode opc, TCGType type, unsigned vece,
                              TCGv_vec r, TCGv_vec a, TCGv_vec b);
 void tcg_gen_ishplus_fp_vec4(TCGOpcode opc, TCGType type, unsigned vece,
                              TCGv_vec r, TCGv_vec a, TCGv_vec b, TCGv_vec c);
+bool tcg_ishplus_have_ld_v128(void);
+void tcg_gen_ishplus_qemu_st_v128(TCGv_vec val, TCGv_i64 addr, TCGArg idx,
+                                  MemOp memop);
+void tcg_gen_ishplus_qemu_ld_v128(TCGv_vec val, TCGv_i64 addr, TCGArg idx,
+                                  MemOp memop);
 #endif
 void tcg_gen_umin_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b);
 void tcg_gen_smax_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b);

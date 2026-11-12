@@ -133,6 +133,7 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
     db->tb = tb;
     db->pc_first = pc;
     db->pc_next = pc;
+    db->ishplus_cover_end = 0;
     db->is_jmp = DISAS_NEXT;
     db->num_insns = 0;
     db->max_insns = *max_insns;
@@ -223,6 +224,11 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
     /* May be used by disas_log or plugin callbacks. */
     tb->size = db->pc_next - db->pc_first;
     tb->icount = db->num_insns;
+    /* iSH+: and code read beyond the TB's last insn (only on its one page) */
+    if (db->ishplus_cover_end > db->pc_next && !db->host_addr[1] &&
+        ((db->ishplus_cover_end - 1) ^ db->pc_first) < TARGET_PAGE_SIZE) {
+        tb->size = db->ishplus_cover_end - db->pc_first;
+    }
 
     if (plugin_enabled) {
         plugin_gen_tb_end(cpu, db->num_insns);

@@ -29,6 +29,12 @@ DEF(aa64_fmin_vec, 1, 2, 0, TCG_OPF_VECTOR)
 DEF(aa64_fmaxnm_vec, 1, 2, 0, TCG_OPF_VECTOR)
 DEF(aa64_fminnm_vec, 1, 2, 0, TCG_OPF_VECTOR)
 DEF(aa64_fabd_vec, 1, 2, 0, TCG_OPF_VECTOR)
+DEF(aa64_fnmul_vec, 1, 2, 0, TCG_OPF_VECTOR)
+/* iSH+: a 128-bit guest load into a vector register (like qemu_ld_i128) */
+DEF(aa64_qemu_ld_v128, 1, 1, 1,
+    TCG_OPF_VECTOR | TCG_OPF_CALL_CLOBBER | TCG_OPF_SIDE_EFFECTS)
+DEF(aa64_qemu_st_v128, 0, 2, 1,
+    TCG_OPF_VECTOR | TCG_OPF_CALL_CLOBBER | TCG_OPF_SIDE_EFFECTS)
 DEF(aa64_fsqrt_vec, 1, 1, 0, TCG_OPF_VECTOR)
 DEF(aa64_fmla_vec, 1, 3, 0, TCG_OPF_VECTOR)
 DEF(aa64_fmls_vec, 1, 3, 0, TCG_OPF_VECTOR)

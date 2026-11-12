@@ -659,6 +659,56 @@ static void tcg_gen_qemu_ld_i128_int(TCGv_i128 val, TCGTemp *addr,
                                   QEMU_PLUGIN_MEM_R);
 }
 
+#ifdef TCG_TARGET_ISHPLUS_NATIVE_FP
+/*
+ * iSH+: a little-endian 128-bit guest load into a vector, as qemu_ld_i128
+ * would load it. Only when TCG_TARGET_HAS_qemu_ldst_i128 (LSE2).
+ */
+static void ishplus_ldst_v128(TCGOpcode opc, TCGv_vec val, TCGv_i64 addr,
+                              TCGArg idx, MemOp memop)
+{
+    TCGOp *op;
+
+    tcg_debug_assert(TCG_TARGET_HAS_qemu_ldst_i128);
+    tcg_debug_assert(tcg_ctx->addr_type == TCG_TYPE_I64);
+    tcg_debug_assert((memop & (MO_SIZE | MO_SIGN | MO_BSWAP)) == MO_128);
+
+    check_max_alignment(memop_alignment_bits(memop));
+    if (opc == INDEX_op_aa64_qemu_ld_v128) {
+        tcg_gen_req_mo(TCG_MO_LD_LD | TCG_MO_ST_LD);
+    } else {
+        tcg_gen_req_mo(TCG_MO_ST_LD | TCG_MO_ST_ST);
+    }
+    if (!(tcg_ctx->gen_tb->cflags & CF_PARALLEL)) {
+        memop &= ~MO_ATOM_MASK;
+        memop |= MO_ATOM_NONE;
+    }
+    op = tcg_emit_op(opc, 3);
+    TCGOP_TYPE(op) = TCG_TYPE_V128;
+    TCGOP_VECE(op) = MO_64;
+    op->args[0] = tcgv_vec_arg(val);
+    op->args[1] = tcgv_i64_arg(addr);
+    op->args[2] = make_memop_idx(memop, idx);
+}
+
+void tcg_gen_ishplus_qemu_st_v128(TCGv_vec val, TCGv_i64 addr, TCGArg idx,
+                                  MemOp memop)
+{
+    ishplus_ldst_v128(INDEX_op_aa64_qemu_st_v128, val, addr, idx, memop);
+}
+
+bool tcg_ishplus_have_ld_v128(void)
+{
+    return TCG_TARGET_HAS_qemu_ldst_i128;
+}
+
+void tcg_gen_ishplus_qemu_ld_v128(TCGv_vec val, TCGv_i64 addr, TCGArg idx,
+                                  MemOp memop)
+{
+    ishplus_ldst_v128(INDEX_op_aa64_qemu_ld_v128, val, addr, idx, memop);
+}
+#endif
+
 void tcg_gen_qemu_ld_i128_chk(TCGv_i128 val, TCGTemp *addr, TCGArg idx,
                               MemOp memop, TCGType addr_type)
 {

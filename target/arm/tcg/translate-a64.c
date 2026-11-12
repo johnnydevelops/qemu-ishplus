@@ -568,8 +568,109 @@ static void gen_a64_lookup_and_goto_ptr(DisasContext *s)
     tcg_gen_lookup_and_goto_ptr();
 }
 
+/*
+ * iSH+: dead flags at TB exits. QEMU computes all of N, Z, C and V for every
+ * flag-setting insn, and must store them at the end of the TB, though the
+ * code that follows usually sets them again before reading any (a loop's
+ * cmp + b.cond). Where the guest code at a TB's exit, read ahead on the
+ * TB's own page (which the TB then covers, so that changing that code
+ * invalidates the TB), sets all four flags before reading any, they are
+ * discarded and their computations dropped. Only exceptions and interrupts
+ * taken in between see their stale values (and they restore them as they
+ * were, still dead).
+ */
+enum { FL_NEUTRAL, FL_WRITE, FL_OTHER };
+
+static int ishplus_insn_flags(uint32_t insn)
+{
+    if ((insn & 0x1F800000) == 0x11000000 ||        /* add/sub immediate */
+        (insn & 0x1F000000) == 0x0B000000) {        /* add/sub register */
+        return insn & (1u << 29) ? FL_WRITE : FL_NEUTRAL;   /* ADDS/SUBS */
+    }
+    if ((insn & 0x1F800000) == 0x12000000 ||        /* logical immediate */
+        (insn & 0x1F000000) == 0x0A000000) {        /* logical register */
+        return (insn & 0x60000000) == 0x60000000 ? FL_WRITE : FL_NEUTRAL;
+    }
+    if ((insn & 0x1F800000) == 0x12800000 ||        /* move wide */
+        (insn & 0x1F000000) == 0x13000000 ||        /* bitfield, extract */
+        (insn & 0x1F000000) == 0x10000000 ||        /* adr, adrp */
+        (insn & 0x1F000000) == 0x1B000000 ||        /* 3-source (madd...) */
+        (insn & 0x7FE00000) == 0x1AC00000 ||        /* 2-source, S=0 */
+        (insn & 0x7FE00000) == 0x5AC00000 ||        /* 1-source, S=0 */
+        (insn & 0x3B000000) == 0x39000000 ||        /* ld/st unsigned imm */
+        (insn & 0x3B000000) == 0x38000000 ||        /* ld/st other, atomics */
+        (insn & 0x3A000000) == 0x28000000 ||        /* ld/st pair */
+        (insn & 0x3B000000) == 0x18000000 ||        /* load literal */
+        (insn & 0x3F000000) == 0x08000000 ||        /* ld/st exclusive */
+        (insn & 0xFFFFF01F) == 0xD503201F) {        /* hints (nop, bti...) */
+        return FL_NEUTRAL;
+    }
+    if ((insn & 0x0E000000) == 0x0E000000) {        /* SIMD and FP */
+        if ((insn & 0xFF20FC00) == 0x1E202000) {
+            return FL_WRITE;                        /* FCMP, FCMPE */
+        }
+        if ((insn & 0xFF200C00) == 0x1E200400 ||    /* FCCMP */
+            (insn & 0xFF200C00) == 0x1E200C00 ||    /* FCSEL */
+            (insn & 0x5F20FC00) == 0x1E200000) {    /* FP <-> int (FJCVTZS) */
+            return FL_OTHER;
+        }
+        return FL_NEUTRAL;
+    }
+    return FL_OTHER;
+}
+
+/* Are the flags dead at @dest (all set before any is read)? */
+static bool ishplus_flags_dead_at(DisasContext *s, vaddr dest)
+{
+    vaddr first = s->base.pc_first;
+
+    if (!s->base.host_addr[0] || s->base.host_addr[1] || s->ss_active ||
+        dest < first || ((dest ^ first) & TARGET_PAGE_MASK)) {
+        return false;
+    }
+    for (int i = 0; i < 16; i++) {
+        vaddr a = dest + 4 * i;
+
+        if ((a ^ first) & TARGET_PAGE_MASK) {
+            return false;
+        }
+        switch (ishplus_insn_flags(ldl_le_p(s->base.host_addr[0] + (a - first)))) {
+        case FL_WRITE:
+            s->base.ishplus_cover_end = MAX(s->base.ishplus_cover_end, a + 4);
+            return true;
+        case FL_NEUTRAL:
+            continue;
+        default:
+            return false;
+        }
+    }
+    return false;
+}
+
+/* Before a TB exit's branch: discard the flags dead on both ways, but @keep */
+static void ishplus_discard_flags(DisasContext *s, int64_t diff1,
+                                  int64_t diff2, unsigned keep)
+{
+    if (ishplus_flags_dead_at(s, s->pc_curr + diff1) &&
+        ishplus_flags_dead_at(s, s->pc_curr + diff2)) {
+        if (!(keep & 8)) {
+            tcg_gen_discard_i32(cpu_NF);
+        }
+        if (!(keep & 4)) {
+            tcg_gen_discard_i32(cpu_ZF);
+        }
+        if (!(keep & 2)) {
+            tcg_gen_discard_i32(cpu_CF);
+        }
+        if (!(keep & 1)) {
+            tcg_gen_discard_i32(cpu_VF);
+        }
+    }
+}
+
 static void gen_goto_tb(DisasContext *s, int n, int64_t diff)
 {
+    ishplus_discard_flags(s, diff, diff, 0);
     if (use_goto_tb(s, s->pc_curr + diff)) {
         /*
          * For pcrel, the pc must always be up-to-date on entry to
@@ -1279,10 +1380,26 @@ static void do_gpr_ld(DisasContext *s, TCGv_i64 dest, TCGv_i64 tcg_addr,
 /*
  * Store from FP register to memory
  */
+#ifdef TCG_TARGET_ISHPLUS_NATIVE_FP
+static TCGv_vec native_ld(DisasContext *s, TCGType type, int reg);
+static void native_st(TCGv_vec v, DisasContext *s, int reg, bool is_q);
+#endif
+
 static void do_fp_st(DisasContext *s, int srcidx, TCGv_i64 tcg_addr, MemOp mop)
 {
     /* This writes the bottom N bits of a 128 bit wide vector to memory */
-    TCGv_i64 tmplo = tcg_temp_new_i64();
+    TCGv_i64 tmplo;
+
+#ifdef TCG_TARGET_ISHPLUS_NATIVE_FP
+    /* iSH+: a 128-bit store straight from a host vector register */
+    if ((mop & MO_SIZE) == MO_128 && !(mop & MO_BSWAP) &&
+        s->fp_native && tcg_ishplus_have_ld_v128()) {
+        tcg_gen_ishplus_qemu_st_v128(native_ld(s, TCG_TYPE_V128, srcidx),
+                                     tcg_addr, get_mem_index(s), mop);
+        return;
+    }
+#endif
+    tmplo = tcg_temp_new_i64();
 
     tcg_gen_ld_i64(tmplo, tcg_env, fp_reg_offset(s, srcidx, MO_64));
 
@@ -1302,11 +1419,28 @@ static void do_fp_st(DisasContext *s, int srcidx, TCGv_i64 tcg_addr, MemOp mop)
 /*
  * Load from memory to FP register
  */
+
 static void do_fp_ld(DisasContext *s, int destidx, TCGv_i64 tcg_addr, MemOp mop)
 {
     /* This always zero-extends and writes to a full 128 bit wide vector */
     TCGv_i64 tmplo = tcg_temp_new_i64();
     TCGv_i64 tmphi = NULL;
+
+#ifdef TCG_TARGET_ISHPLUS_NATIVE_FP
+    /*
+     * iSH+: a 128-bit load straight into a host vector register, stored to
+     * env in one piece (a 128-bit read of it could not be forwarded from
+     * two 64-bit stores) and kept for native FP.
+     */
+    if ((mop & MO_SIZE) == MO_128 && !(mop & MO_BSWAP) &&
+        s->fp_native && tcg_ishplus_have_ld_v128()) {
+        TCGv_vec v = tcg_temp_new_vec(TCG_TYPE_V128);
+
+        tcg_gen_ishplus_qemu_ld_v128(v, tcg_addr, get_mem_index(s), mop);
+        native_st(v, s, destidx, true);
+        return;
+    }
+#endif
 
     if ((mop & MO_SIZE) < MO_128) {
         tcg_gen_qemu_ld_i64(tmplo, tcg_addr, get_mem_index(s), mop);
@@ -1758,6 +1892,7 @@ static bool trans_CBZ(DisasContext *s, arg_cbz *a)
     tcg_cmp = read_cpu_reg(s, a->rt, a->sf);
     reset_btype(s);
 
+    ishplus_discard_flags(s, 4, a->imm, 0);
     match = gen_disas_label(s);
     tcg_gen_brcondi_i64(a->nz ? TCG_COND_NE : TCG_COND_EQ,
                         tcg_cmp, 0, match.label);
@@ -1777,6 +1912,7 @@ static bool trans_TBZ(DisasContext *s, arg_tbz *a)
 
     reset_btype(s);
 
+    ishplus_discard_flags(s, 4, a->imm, 0);
     match = gen_disas_label(s);
     tcg_gen_brcondi_i64(a->nz ? TCG_COND_NE : TCG_COND_EQ,
                         tcg_cmp, 0, match.label);
@@ -1795,7 +1931,13 @@ static bool trans_B_cond(DisasContext *s, arg_B_cond *a)
     reset_btype(s);
     if (a->cond < 0x0e) {
         /* genuinely conditional branches */
-        DisasLabel match = gen_disas_label(s);
+        static const uint8_t reads[7] = {   /* NZCV read by cond >> 1 */
+            4, 2, 8, 1, 6, 9, 13,
+        };
+        DisasLabel match;
+
+        ishplus_discard_flags(s, 4, a->imm, reads[a->cond >> 1]);
+        match = gen_disas_label(s);
         arm_gen_test_cc(a->cond, match.label);
         gen_goto_tb(s, 0, 4);
         set_disas_label(s, match);
@@ -5311,15 +5453,83 @@ typedef struct FPScalar {
  * vectors) uses the helpers.
  */
 #ifdef TCG_TARGET_ISHPLUS_NATIVE_FP
-static void native_ld(TCGv_vec v, DisasContext *s, int reg)
+/*
+ * Forget the kept values that the ops emitted since the last sync may have
+ * changed: a store into a vector register in env forgets that register;
+ * any other store not based on env, call, guest memory access, label or
+ * branch forgets all (the kept values are TCG temps that do not live past
+ * a branch).
+ */
+static void native_sync(DisasContext *s)
 {
+    const intptr_t base = offsetof(CPUARMState, vfp.zregs[0]);
+    const intptr_t end = offsetof(CPUARMState, vfp.zregs[32]);
+    TCGTemp *env = tcgv_ptr_temp(tcg_env);
+    TCGOp *op = s->native_scan ? QTAILQ_NEXT(s->native_scan, link)
+                               : QTAILQ_FIRST(&tcg_ctx->ops);
+
+    for (; op; op = QTAILQ_NEXT(op, link)) {
+        switch (op->opc) {
+        case INDEX_op_st8_i32:
+        case INDEX_op_st16_i32:
+        case INDEX_op_st_i32:
+        case INDEX_op_st8_i64:
+        case INDEX_op_st16_i64:
+        case INDEX_op_st32_i64:
+        case INDEX_op_st_i64:
+        case INDEX_op_st_vec:
+            if (arg_temp(op->args[1]) == env) {
+                intptr_t ofs = op->args[2];
+
+                if (ofs >= base && ofs < end) {
+                    s->native_val[(ofs - base) / sizeof(ARMVectorReg)] = NULL;
+                }
+                break;
+            }
+            memset(s->native_val, 0, sizeof(s->native_val));
+            break;
+        case INDEX_op_call:
+            memset(s->native_val, 0, sizeof(s->native_val));
+            break;
+        default:
+            /*
+             * Also at guest loads and stores: they clobber the host vector
+             * registers (their slow path is a call), so a value kept past
+             * one would be spilled, which costs more than reloading env.
+             */
+            if (tcg_op_defs[op->opc].flags & (TCG_OPF_BB_END | TCG_OPF_CALL_CLOBBER)) {
+                memset(s->native_val, 0, sizeof(s->native_val));
+            }
+            break;
+        }
+    }
+    s->native_scan = tcg_last_op();
+}
+
+/* A register's value (read only): kept from an earlier native insn, or loaded */
+static TCGv_vec native_ld(DisasContext *s, TCGType type, int reg)
+{
+    TCGv_vec v;
+
+    native_sync(s);
+    if (s->native_val[reg] && s->native_type[reg] == type) {
+        return s->native_val[reg];
+    }
+    v = tcg_temp_new_vec(type);
     tcg_gen_ld_vec(v, tcg_env, vec_full_reg_offset(s, reg));
+    s->native_val[reg] = v;
+    s->native_type[reg] = type;
+    return v;
 }
 
 static void native_st(TCGv_vec v, DisasContext *s, int reg, bool is_q)
 {
+    native_sync(s);
     tcg_gen_st_vec(v, tcg_env, vec_full_reg_offset(s, reg));
     clear_vec_high(s, is_q, reg);
+    s->native_scan = tcg_last_op();     /* these stores are the value kept */
+    s->native_val[reg] = v;
+    s->native_type[reg] = is_q ? TCG_TYPE_V128 : TCG_TYPE_V64;
 }
 
 /* d = n op m */
@@ -5327,12 +5537,11 @@ static void native_fp3(DisasContext *s, TCGOpcode op, bool is_q, MemOp esz,
                        int rd, int rn, int rm)
 {
     TCGType type = is_q ? TCG_TYPE_V128 : TCG_TYPE_V64;
-    TCGv_vec n = tcg_temp_new_vec(type), m = tcg_temp_new_vec(type);
+    TCGv_vec n = native_ld(s, type, rn), m = native_ld(s, type, rm);
+    TCGv_vec d = tcg_temp_new_vec(type);
 
-    native_ld(n, s, rn);
-    native_ld(m, s, rm);
-    tcg_gen_ishplus_fp_vec3(op, type, esz, n, n, m);
-    native_st(n, s, rd, is_q);
+    tcg_gen_ishplus_fp_vec3(op, type, esz, d, n, m);
+    native_st(d, s, rd, is_q);
 }
 
 /* d = a +- n * m, fused */
@@ -5340,15 +5549,18 @@ static void native_fp_fused(DisasContext *s, TCGOpcode op, bool is_q,
                             MemOp esz, int rd, int ra, int rn, int rm)
 {
     TCGType type = is_q ? TCG_TYPE_V128 : TCG_TYPE_V64;
-    TCGv_vec d = tcg_temp_new_vec(type), n = tcg_temp_new_vec(type);
-    TCGv_vec m = tcg_temp_new_vec(type);
+    TCGv_vec d = tcg_temp_new_vec(type);
+    TCGv_vec n = native_ld(s, type, rn), m = native_ld(s, type, rm);
 
-    native_ld(d, s, ra);
-    native_ld(n, s, rn);
-    native_ld(m, s, rm);
+    tcg_gen_mov_vec(d, native_ld(s, type, ra));
     tcg_gen_ishplus_fp_vec4(op, type, esz, d, d, n, m);
     native_st(d, s, rd, is_q);
 }
+
+static void gen_fnmul_d(TCGv_i64 d, TCGv_i64 n, TCGv_i64 m, TCGv_ptr s);
+
+/* The unary ops: the host instruction for a helper (single or double) */
+static bool native_fp1_op(const void *gen_d, TCGOpcode *op);
 
 static bool native_fp3_scalar_op(void (*gen_d)(TCGv_i64, TCGv_i64, TCGv_i64, TCGv_ptr),
                                  TCGOpcode *op)
@@ -5369,6 +5581,8 @@ static bool native_fp3_scalar_op(void (*gen_d)(TCGv_i64, TCGv_i64, TCGv_i64, TCG
         *op = INDEX_op_aa64_fmaxnm_vec;
     } else if (gen_d == gen_helper_vfp_minnumd) {
         *op = INDEX_op_aa64_fminnm_vec;
+    } else if (gen_d == gen_fnmul_d) {
+        *op = INDEX_op_aa64_fnmul_vec;     /* the product, rounded, negated */
     } else {
         return false;
     }
@@ -6957,13 +7171,13 @@ static bool do_fp3_vector_idx(DisasContext *s, arg_qrrx_e *a,
     if (s->fp_native && a->q && (esz == MO_32 || esz == MO_64) &&
         (fns[esz - 1] == gen_helper_gvec_fmul_idx_s ||
          fns[esz - 1] == gen_helper_gvec_fmul_idx_d)) {
-        TCGv_vec n = tcg_temp_new_vec(TCG_TYPE_V128);
+        TCGv_vec n = native_ld(s, TCG_TYPE_V128, a->rn);
         TCGv_vec m = tcg_temp_new_vec(TCG_TYPE_V128);
+        TCGv_vec d = tcg_temp_new_vec(TCG_TYPE_V128);
 
-        native_ld(n, s, a->rn);
         tcg_gen_dup_mem_vec(esz, m, tcg_env, vec_reg_offset(s, a->rm, a->idx, esz));
-        tcg_gen_ishplus_fp_vec3(INDEX_op_aa64_fmul_vec, TCG_TYPE_V128, esz, n, n, m);
-        native_st(n, s, a->rd, true);
+        tcg_gen_ishplus_fp_vec3(INDEX_op_aa64_fmul_vec, TCG_TYPE_V128, esz, d, n, m);
+        native_st(d, s, a->rd, true);
         return true;
     }
 #endif
@@ -7011,11 +7225,10 @@ static bool do_fmla_vector_idx(DisasContext *s, arg_qrrx_e *a, bool neg)
     /* iSH+: FMLA/FMLS by element, the host's with the element duplicated */
     if (s->fp_native && a->q && (esz == MO_32 || esz == MO_64)) {
         TCGv_vec d = tcg_temp_new_vec(TCG_TYPE_V128);
-        TCGv_vec n = tcg_temp_new_vec(TCG_TYPE_V128);
+        TCGv_vec n = native_ld(s, TCG_TYPE_V128, a->rn);
         TCGv_vec m = tcg_temp_new_vec(TCG_TYPE_V128);
 
-        native_ld(d, s, a->rd);
-        native_ld(n, s, a->rn);
+        tcg_gen_mov_vec(d, native_ld(s, TCG_TYPE_V128, a->rd));
         tcg_gen_dup_mem_vec(esz, m, tcg_env, vec_reg_offset(s, a->rm, a->idx, esz));
         tcg_gen_ishplus_fp_vec4(neg ? INDEX_op_aa64_fmls_vec : INDEX_op_aa64_fmla_vec,
                                 TCG_TYPE_V128, esz, d, d, n, m);
@@ -9066,7 +9279,23 @@ static bool do_fp1_scalar_with_fpsttype(DisasContext *s, arg_rr_e *a,
     TCGv_ptr fpst;
     TCGv_i64 t64;
     TCGv_i32 t32;
-    int check = fp_access_check_scalar_hsd(s, a->esz);
+    int check;
+#ifdef TCG_TARGET_ISHPLUS_NATIVE_FP
+    TCGOpcode nop;
+
+    if (s->fp_native && fpsttype == FPST_A64 && rmode < 0 &&
+        (a->esz == MO_32 || a->esz == MO_64) && native_fp1_op(f->gen_d, &nop)) {
+        if (fp_access_check(s)) {
+            TCGv_vec d = tcg_temp_new_vec(TCG_TYPE_V64);
+
+            tcg_gen_ishplus_fp_vec2(nop, TCG_TYPE_V64, a->esz, d,
+                                    native_ld(s, TCG_TYPE_V64, a->rn));
+            native_st(d, s, a->rd, false);
+        }
+        return true;
+    }
+#endif
+    check = fp_access_check_scalar_hsd(s, a->esz);
 
     if (check <= 0) {
         return check == 0;
@@ -9123,6 +9352,17 @@ static const FPScalar1 f_scalar_fsqrt = {
     gen_helper_vfp_sqrtd,
 };
 TRANS(FSQRT_s, do_fp1_scalar, a, &f_scalar_fsqrt, -1)
+
+#ifdef TCG_TARGET_ISHPLUS_NATIVE_FP
+static bool native_fp1_op(const void *gen_d, TCGOpcode *op)
+{
+    if (gen_d == (const void *)gen_helper_vfp_sqrtd) {
+        *op = INDEX_op_aa64_fsqrt_vec;
+        return true;
+    }
+    return false;
+}
+#endif
 
 static const FPScalar1 f_scalar_frint = {
     gen_helper_advsimd_rinth,
@@ -10046,7 +10286,23 @@ static bool do_fp1_vector(DisasContext *s, arg_qrr_e *a,
 {
     TCGv_i32 tcg_rmode = NULL;
     TCGv_ptr fpst;
-    int check = fp_access_check_vector_hsd(s, a->q, a->esz);
+    int check;
+#ifdef TCG_TARGET_ISHPLUS_NATIVE_FP
+    TCGOpcode nop;
+
+    if (s->fp_native && a->q && rmode < 0 &&
+        (a->esz == MO_32 || a->esz == MO_64) && native_fp1_op(f->gen_d, &nop)) {
+        if (fp_access_check(s)) {
+            TCGv_vec d = tcg_temp_new_vec(TCG_TYPE_V128);
+
+            tcg_gen_ishplus_fp_vec2(nop, TCG_TYPE_V128, a->esz, d,
+                                    native_ld(s, TCG_TYPE_V128, a->rn));
+            native_st(d, s, a->rd, true);
+        }
+        return true;
+    }
+#endif
+    check = fp_access_check_vector_hsd(s, a->q, a->esz);
 
     if (check <= 0) {
         return check == 0;
@@ -10440,6 +10696,8 @@ static void aarch64_tr_init_disas_context(DisasContextBase *dcbase,
     dc->fpcr_nep = EX_TBFLAG_A64(tb_flags, NEP);
 #ifdef TCG_TARGET_ISHPLUS_NATIVE_FP
     dc->fp_native = EX_TBFLAG_A64(tb_flags, FPDEFAULT);
+    dc->native_scan = tcg_last_op();
+    memset(dc->native_val, 0, sizeof(dc->native_val));
 #endif
     dc->vec_len = 0;
     dc->vec_stride = 0;
