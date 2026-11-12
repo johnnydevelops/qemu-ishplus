@@ -3106,8 +3106,16 @@ static void handle_sys(DisasContext *s, bool isread,
         /*
          * A write to any coprocessor register that ends a TB
          * must rebuild the hflags for the next TB.
+         * iSH+: DAIF (the kernel's interrupt masking, at every syscall) is
+         * part of the key of the cached hflags: no need to drop them.
          */
-        gen_rebuild_hflags(s);
+        if (ri->state == ARM_CP_STATE_AA64 &&
+            ri->fieldoffset == offsetof(CPUARMState, daif)) {
+            gen_helper_ishplus_rebuild_hflags_keyed(tcg_env,
+                                                    tcg_constant_i32(s->current_el));
+        } else {
+            gen_rebuild_hflags(s);
+        }
         /*
          * We default to ending the TB on a coprocessor register write,
          * but allow this to be suppressed by the register definition

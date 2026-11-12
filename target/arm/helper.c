@@ -2240,6 +2240,7 @@ static const ARMCPRegInfo v6k_cp_reginfo[] = {
       .opc0 = 3, .opc1 = 3, .opc2 = 2, .crn = 13, .crm = 0,
       .access = PL0_RW,
       .fgt = FGT_TPIDR_EL0,
+      .type = ARM_CP_SUPPRESS_TB_END,   /* iSH+: plain storage, no hflags */
       .fieldoffset = offsetof(CPUARMState, cp15.tpidr_el[0]), .resetvalue = 0 },
     { .name = "TPIDRURW", .cp = 15, .crn = 13, .crm = 0, .opc1 = 0, .opc2 = 2,
       .access = PL0_RW,
@@ -2251,6 +2252,7 @@ static const ARMCPRegInfo v6k_cp_reginfo[] = {
       .opc0 = 3, .opc1 = 3, .opc2 = 3, .crn = 13, .crm = 0,
       .access = PL0_R | PL1_W,
       .fgt = FGT_TPIDRRO_EL0,
+      .type = ARM_CP_SUPPRESS_TB_END,   /* iSH+: plain storage, no hflags */
       .fieldoffset = offsetof(CPUARMState, cp15.tpidrro_el[0]),
       .resetvalue = 0},
     { .name = "TPIDRURO", .cp = 15, .crn = 13, .crm = 0, .opc1 = 0, .opc2 = 3,
@@ -2263,6 +2265,7 @@ static const ARMCPRegInfo v6k_cp_reginfo[] = {
       .opc0 = 3, .opc1 = 0, .opc2 = 4, .crn = 13, .crm = 0,
       .access = PL1_RW,
       .fgt = FGT_TPIDR_EL1,
+      .type = ARM_CP_SUPPRESS_TB_END,   /* iSH+: plain storage, no hflags */
       .fieldoffset = offsetof(CPUARMState, cp15.tpidr_el[1]), .resetvalue = 0 },
     { .name = "TPIDRPRW", .opc1 = 0, .cp = 15, .crn = 13, .crm = 0, .opc2 = 4,
       .access = PL1_RW,
@@ -5284,13 +5287,13 @@ static const ARMCPRegInfo v8_cp_reginfo[] = {
       .bank_fieldoffsets = { offsetoflow32(CPUARMState, cp15.dacr_s),
                              offsetoflow32(CPUARMState, cp15.dacr_ns) } },
     { .name = "ELR_EL1", .state = ARM_CP_STATE_AA64,
-      .type = ARM_CP_ALIAS,
+      .type = ARM_CP_ALIAS | ARM_CP_SUPPRESS_TB_END,    /* iSH+: no hflags */
       .opc0 = 3, .opc1 = 0, .crn = 4, .crm = 0, .opc2 = 1,
       .access = PL1_RW, .accessfn = access_nv1,
       .nv2_redirect_offset = 0x230 | NV2_REDIR_NV1,
       .fieldoffset = offsetof(CPUARMState, elr_el[1]) },
     { .name = "SPSR_EL1", .state = ARM_CP_STATE_AA64,
-      .type = ARM_CP_ALIAS,
+      .type = ARM_CP_ALIAS | ARM_CP_SUPPRESS_TB_END,    /* iSH+: no hflags */
       .opc0 = 3, .opc1 = 0, .crn = 4, .crm = 0, .opc2 = 0,
       .access = PL1_RW, .accessfn = access_nv1,
       .nv2_redirect_offset = 0x160 | NV2_REDIR_NV1,
@@ -5303,7 +5306,7 @@ static const ARMCPRegInfo v8_cp_reginfo[] = {
     { .name = "SP_EL0", .state = ARM_CP_STATE_AA64,
       .opc0 = 3, .opc1 = 0, .crn = 4, .crm = 1, .opc2 = 0,
       .access = PL1_RW, .accessfn = sp_el0_access,
-      .type = ARM_CP_ALIAS,
+      .type = ARM_CP_ALIAS | ARM_CP_SUPPRESS_TB_END,    /* iSH+: no hflags */
       .fieldoffset = offsetof(CPUARMState, sp_el[0]) },
     { .name = "SP_EL1", .state = ARM_CP_STATE_AA64,
       .opc0 = 3, .opc1 = 4, .crn = 4, .crm = 1, .opc2 = 0,
@@ -10973,7 +10976,7 @@ static void arm_cpu_do_interrupt_aarch64(CPUState *cs)
     aarch64_restore_sp(env, new_el);
 
     if (tcg_enabled()) {
-        helper_rebuild_hflags_a64(env, new_el);
+        ishplus_rebuild_hflags_a64_exc(env, new_el);
     }
 
     env->pc = addr;

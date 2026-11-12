@@ -101,14 +101,14 @@ void HELPER(msr_i_daifset)(CPUARMState *env, uint32_t imm)
 {
     daif_check(env, 0x1e, imm, GETPC());
     env->daif |= (imm << 6) & PSTATE_DAIF;
-    arm_rebuild_hflags(env);
+    ishplus_rebuild_hflags_a64_exc(env, arm_current_el(env));  /* (DAIF: keyed) */
 }
 
 void HELPER(msr_i_daifclear)(CPUARMState *env, uint32_t imm)
 {
     daif_check(env, 0x1f, imm, GETPC());
     env->daif &= ~((imm << 6) & PSTATE_DAIF);
-    arm_rebuild_hflags(env);
+    ishplus_rebuild_hflags_a64_exc(env, arm_current_el(env));  /* (DAIF: keyed) */
 }
 
 /* Convert a softfloat float_relation_ (as returned by
@@ -778,7 +778,7 @@ void HELPER(exception_return)(CPUARMState *env, uint64_t new_pc)
             env->pstate &= ~PSTATE_SS;
         }
         aarch64_restore_sp(env, new_el);
-        helper_rebuild_hflags_a64(env, new_el);
+        ishplus_rebuild_hflags_a64_exc(env, new_el);
 
         /*
          * Apply TBI to the exception return address.  We had to delay this

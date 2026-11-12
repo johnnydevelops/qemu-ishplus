@@ -757,6 +757,21 @@ typedef struct CPUArchState {
     /* Fields up to this point are cleared by a CPU reset */
     struct {} end_reset_fields;
 
+    /*
+     * iSH+ (tcg/hflags.c): the hflags exception entry and return computed
+     * per EL, for the same PSTATE and DAIF while no other rebuild (a system
+     * register or FPCR write, reset...) happened since (generation)
+     */
+    uint64_t ishplus_hf_gen;    /* (bumped by every full rebuild, reset included) */
+    uint8_t ishplus_hf_next[4];
+#define ISHPLUS_HF_WAYS 4
+    struct {
+        uint64_t gen;
+        uint64_t daif;
+        uint32_t pstate;
+        CPUARMTBFlags flags;
+    } ishplus_hf_cache[4][ISHPLUS_HF_WAYS];
+
     /* Fields after this point are preserved across CPU reset. */
 
     /* Internal CPU feature flags.  */
@@ -3241,6 +3256,8 @@ void arm_register_el_change_hook(ARMCPU *cpu, ARMELChangeHookFn *hook, void
  * Rebuild the cached TBFLAGS for arbitrary changed processor state.
  */
 void arm_rebuild_hflags(CPUARMState *env);
+/* iSH+: at exception entry and return, reusing the last hflags of the EL */
+void ishplus_rebuild_hflags_a64_exc(CPUARMState *env, int el);
 
 /**
  * aa32_vfp_dreg:

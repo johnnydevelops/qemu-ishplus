@@ -455,6 +455,7 @@ static CPUARMTBFlags rebuild_hflags_internal(CPUARMState *env)
 
 void arm_rebuild_hflags(CPUARMState *env)
 {
+    env->ishplus_hf_gen++;      /* (state may have changed: no cached hflags) */
     env->hflags = rebuild_hflags_internal(env);
 }
 
@@ -464,6 +465,7 @@ void arm_rebuild_hflags(CPUARMState *env)
  */
 void HELPER(rebuild_hflags_m32_newel)(CPUARMState *env)
 {
+    env->ishplus_hf_gen++;
     int el = arm_current_el(env);
     int fp_el = fp_exception_el(env, el);
     ARMMMUIdx mmu_idx = arm_mmu_idx_el(env, el);
@@ -473,6 +475,7 @@ void HELPER(rebuild_hflags_m32_newel)(CPUARMState *env)
 
 void HELPER(rebuild_hflags_m32)(CPUARMState *env, int el)
 {
+    env->ishplus_hf_gen++;
     int fp_el = fp_exception_el(env, el);
     ARMMMUIdx mmu_idx = arm_mmu_idx_el(env, el);
 
@@ -485,6 +488,7 @@ void HELPER(rebuild_hflags_m32)(CPUARMState *env, int el)
  */
 void HELPER(rebuild_hflags_a32_newel)(CPUARMState *env)
 {
+    env->ishplus_hf_gen++;
     int el = arm_current_el(env);
     int fp_el = fp_exception_el(env, el);
     ARMMMUIdx mmu_idx = arm_mmu_idx_el(env, el);
@@ -493,6 +497,7 @@ void HELPER(rebuild_hflags_a32_newel)(CPUARMState *env)
 
 void HELPER(rebuild_hflags_a32)(CPUARMState *env, int el)
 {
+    env->ishplus_hf_gen++;
     int fp_el = fp_exception_el(env, el);
     ARMMMUIdx mmu_idx = arm_mmu_idx_el(env, el);
 
@@ -504,7 +509,42 @@ void HELPER(rebuild_hflags_a64)(CPUARMState *env, int el)
     int fp_el = fp_exception_el(env, el);
     ARMMMUIdx mmu_idx = arm_mmu_idx_el(env, el);
 
+    env->ishplus_hf_gen++;      /* (a system register write: no cached hflags) */
     env->hflags = rebuild_hflags_a64(env, el, fp_el, mmu_idx);
+}
+
+/*
+ * iSH+: hflags at exception entry and return (every syscall has both), which
+ * depend on the EL, PSTATE and DAIF and on system registers that rarely
+ * change: computed once per EL, reused until another rebuild (which any
+ * change of those registers, FPCR, etc. makes) bumps the generation.
+ */
+void ishplus_rebuild_hflags_a64_exc(CPUARMState *env, int el)
+{
+    typeof(env->ishplus_hf_cache[0][0]) *c = env->ishplus_hf_cache[el & 3];
+    uint64_t gen = env->ishplus_hf_gen;
+    int i;
+
+    for (i = 0; i < ISHPLUS_HF_WAYS; i++) {
+        if (c[i].gen == gen && c[i].pstate == env->pstate &&
+            c[i].daif == env->daif) {
+            env->hflags = c[i].flags;
+            return;
+        }
+    }
+    env->hflags = rebuild_hflags_a64(env, el, fp_exception_el(env, el),
+                                     arm_mmu_idx_el(env, el));
+    i = env->ishplus_hf_next[el & 3]++ % ISHPLUS_HF_WAYS;
+    c[i].gen = gen;
+    c[i].pstate = env->pstate;
+    c[i].daif = env->daif;
+    c[i].flags = env->hflags;
+}
+
+/* After writes of state the cached hflags are keyed on (DAIF) */
+void HELPER(ishplus_rebuild_hflags_keyed)(CPUARMState *env, int el)
+{
+    ishplus_rebuild_hflags_a64_exc(env, el);
 }
 
 void assert_hflags_rebuild_correctly(CPUARMState *env)
