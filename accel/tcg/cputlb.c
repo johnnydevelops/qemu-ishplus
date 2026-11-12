@@ -285,6 +285,8 @@ static inline void tlb_block_cache_clear(CPUTLBDesc *desc)
 
 static void tlb_mmu_flush_locked(CPUTLBDesc *desc, CPUTLBDescFast *fast)
 {
+    desc->ishplus_has_ng = false;
+    desc->ishplus_has_lower = false;
     tlb_block_cache_clear(desc);
     desc->ishplus_evictions = 0;
     desc->n_used_entries = 0;
@@ -422,6 +424,14 @@ static void tlb_flush_by_mmuidx_async_work(CPUState *cpu, run_on_cpu_data data)
 
     all_dirty = cpu->neg.tlb.c.dirty;
     to_clean = asked & all_dirty;
+    /* iSH+: an ASID's invalidation leaves global entries: and TLBs of only those */
+    if (asid_only) {
+        for (work = to_clean; work != 0; work &= work - 1) {
+            if (!cpu->neg.tlb.d[ctz32(work)].ishplus_has_ng) {
+                to_clean &= ~(1 << ctz32(work));
+            }
+        }
+    }
     all_dirty &= ~to_clean;
     cpu->neg.tlb.c.dirty = all_dirty;
 
@@ -485,6 +495,14 @@ void tlb_switch_context(CPUState *cpu, uint16_t idxmap,
         size_t n = tlb_n_entries(fast);
         bool have_table = true;
 
+        /*
+         * Only global entries (the kernel's, for Linux): the same for every
+         * ASID, the TLB stays as it is
+         */
+        if (!desc->ishplus_has_ng) {
+            continue;
+        }
+
         for (int i = 0; i < CPU_TLB_STASH; i++) {
             if (desc->ishplus_stash[i].key == new_key) {
                 found = &desc->ishplus_stash[i];
@@ -534,6 +552,8 @@ void tlb_switch_context(CPUState *cpu, uint16_t idxmap,
             desc->large_page_addr = found->large_page_addr;
             desc->large_page_mask = found->large_page_mask;
             desc->n_used_entries = found->n_used_entries;
+            desc->ishplus_has_ng = true;    /* (not known: assumed) */
+            desc->ishplus_has_lower = true;
             found->table = NULL;
             found->fulltlb = NULL;
             found->key = 0;
@@ -546,6 +566,8 @@ void tlb_switch_context(CPUState *cpu, uint16_t idxmap,
             desc->n_used_entries = 0;
             desc->large_page_addr = -1;
             desc->large_page_mask = -1;
+            desc->ishplus_has_ng = false;
+            desc->ishplus_has_lower = false;
         }
         tlb_block_cache_clear(desc);
         desc->ishplus_evictions = 0;
@@ -895,6 +917,19 @@ static void tlb_flush_range_locked(CPUState *cpu, int midx,
      * If @len is larger than the tlb size, then it will take longer to
      * test all of the entries in the TLB than it will to flush it all.
      */
+    /*
+     * iSH+: a range of the lower half (a process's memory) in a TLB with
+     * no entry there (the kernel's): nothing to flush in it
+     */
+    if (!d->ishplus_has_lower && bits >= 56 && len &&
+        (addr & mask) + len - 1 >= (addr & mask) &&
+        (addr & mask) + len - 1 < ((vaddr)1 << (bits == 64 ? 63 : bits - 1))) {
+        /*
+         * (with 56 bits, top byte ignored: bit 55 selects the half, and
+         * entries are of addresses extended from it)
+         */
+        return;
+    }
     if (mask < f->mask || len > f->mask) {
         tlb_debug("forcing full flush midx %d ("
                   "%016" VADDR_PRIx "/%016" VADDR_PRIx "+%016" VADDR_PRIx ")\n",
@@ -1355,6 +1390,12 @@ void tlb_set_page_full(CPUState *cpu, int mmu_idx,
 
     /* Note that the tlb is no longer clean.  */
     tlb->c.dirty |= 1 << mmu_idx;
+    if (!full->ishplus_global) {
+        desc->ishplus_has_ng = true;
+    }
+    if ((int64_t)addr >= 0) {
+        desc->ishplus_has_lower = true;
+    }
 
     /*
      * iSH+: QEMU resizes a TLB only when it is flushed, so a program that

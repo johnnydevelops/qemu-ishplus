@@ -243,6 +243,11 @@ struct CPUTLBEntryFull {
      * cputlb can fill them from it without walking the page tables again.
      */
     bool ishplus_block_reuse;
+    /*
+     * iSH+: the translation is the same for every ASID (a global mapping:
+     * nG clear), which ASID changes and invalidations leave. Default no.
+     */
+    bool ishplus_global;
 
     /*
      * Additional tlb flags for use by the slow path. If non-zero,
@@ -319,6 +324,10 @@ typedef struct CPUTLBDesc {
      */
     /* iSH+: the TLBs of other address spaces (tlb_switch_context) */
     CPUTLBStash ishplus_stash[CPU_TLB_STASH];
+    /* iSH+: an entry not ishplus_global was added since the last flush */
+    bool ishplus_has_ng;
+    /* iSH+: an entry of the lower half of the address space, likewise */
+    bool ishplus_has_lower;
     uint64_t ishplus_lru;
     /* iSH+: entries evicted since the last flush (cputlb grows the TLB) */
     size_t ishplus_evictions;

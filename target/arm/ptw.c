@@ -2090,6 +2090,9 @@ static bool get_phys_addr_lpae(CPUARMState *env, S1Translate *ptw,
         if (aarch64 && cpu_isar_feature(aa64_bti, cpu)) {
             result->f.extra.arm.guarded = extract64(attrs, 50, 1); /* GP */
         }
+        /* iSH+: nG (bit 11), in the regimes where ASIDs apply */
+        result->f.ishplus_global = regime_has_2_ranges(mmu_idx) &&
+                                   !extract64(attrs, 11, 1);
         device = S1_attrs_are_device(result->cacheattrs.attrs);
     }
 
