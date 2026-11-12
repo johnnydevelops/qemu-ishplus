@@ -612,6 +612,25 @@ void tb_check_watchpoint(CPUState *cpu, uintptr_t retaddr)
  *
  * Called by softmmu_template.h, with iothread mutex not held.
  */
+/*
+ * iSH+: is the guest insn of @retaddr (in a TB) its TB's last? Where an I/O
+ * access may be (without icount, can_do_io is no longer kept by the TBs).
+ */
+bool tb_ishplus_io_insn_is_last(uintptr_t retaddr)
+{
+    uint64_t data[TARGET_INSN_START_WORDS];
+    TranslationBlock *tb;
+
+    if (!retaddr) {
+        return true;
+    }
+    tb = tcg_tb_lookup(retaddr);
+    if (!tb) {
+        return true;
+    }
+    return cpu_unwind_data_from_tb(tb, retaddr, data) <= 1;
+}
+
 void cpu_io_recompile(CPUState *cpu, uintptr_t retaddr)
 {
     TranslationBlock *tb;

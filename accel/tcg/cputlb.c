@@ -41,6 +41,7 @@
 #include "trace.h"
 #include "tb-hash.h"
 #include "tb-internal.h"
+#include "system/cpu-timers.h"
 #include "internal-common.h"
 #include "internal-target.h"
 #ifdef CONFIG_PLUGIN
@@ -1604,7 +1605,8 @@ io_prepare(hwaddr *out_offset, CPUState *cpu, hwaddr xlat,
     section = iotlb_to_section(cpu, xlat, attrs);
     mr_offset = (xlat & TARGET_PAGE_MASK) + addr;
     cpu->mem_io_pc = retaddr;
-    if (!cpu->neg.can_do_io) {
+    if (!cpu->neg.can_do_io ||
+        (!icount_enabled() && !tb_ishplus_io_insn_is_last(retaddr))) {
         cpu_io_recompile(cpu, retaddr);
     }
 

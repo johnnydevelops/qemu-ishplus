@@ -679,27 +679,38 @@ static int ishplus_insn_flags(uint32_t insn)
 static bool ishplus_flags_dead_at(DisasContext *s, vaddr dest)
 {
     vaddr first = s->base.pc_first;
+    vaddr a = dest, lo = dest, hi = dest;
 
     if (!s->base.host_addr[0] || s->base.host_addr[1] || s->ss_active ||
         ((dest ^ first) & TARGET_PAGE_MASK)) {
         return false;
     }
-    for (int i = 0; i < 16; i++) {
-        vaddr a = dest + 4 * i;
+    /* (loops of FP code set the flags only at their end: look that far) */
+    for (int i = 0; i < 64; i++) {
+        uint32_t insn;
 
         if ((a ^ first) & TARGET_PAGE_MASK) {
             return false;
         }
-        switch (ishplus_insn_flags(ldl_le_p(s->base.host_addr[0] + (a - first)))) {
+        insn = ldl_le_p(s->base.host_addr[0] + (a - first));
+        lo = MIN(lo, a);
+        hi = MAX(hi, a + 4);
+        if ((insn & 0xFC000000) == 0x14000000) {
+            /* B: on to its target (on the same page, checked above) */
+            a += sextract32(insn, 0, 26) * 4;
+            continue;
+        }
+        switch (ishplus_insn_flags(insn)) {
         case FL_WRITE:
             /* The TB covers what was read (before or after it) */
-            s->base.ishplus_cover_end = MAX(s->base.ishplus_cover_end, a + 4);
-            if (dest < first && (!s->base.ishplus_cover_start ||
-                                 dest < s->base.ishplus_cover_start)) {
-                s->base.ishplus_cover_start = dest;
+            s->base.ishplus_cover_end = MAX(s->base.ishplus_cover_end, hi);
+            if (lo < first && (!s->base.ishplus_cover_start ||
+                               lo < s->base.ishplus_cover_start)) {
+                s->base.ishplus_cover_start = lo;
             }
             return true;
         case FL_NEUTRAL:
+            a += 4;
             continue;
         default:
             return false;

@@ -40,6 +40,7 @@ void page_table_config_init(void);
 
 #ifndef CONFIG_USER_ONLY
 G_NORETURN void cpu_io_recompile(CPUState *cpu, uintptr_t retaddr);
+bool tb_ishplus_io_insn_is_last(uintptr_t retaddr);
 #endif /* CONFIG_USER_ONLY */
 
 /**
