@@ -11094,6 +11094,29 @@ void arm_cpu_do_interrupt(CPUState *cs)
 }
 #endif /* !CONFIG_USER_ONLY */
 
+/*
+ * iSH+ ishjit: a synchronous exception (SVC) into AArch64 without the BQL,
+ * when no EL change hooks are registered (what the BQL guards in
+ * arm_cpu_do_interrupt: the hooks and interrupt_request, which the caller
+ * leaves alone). False: the caller takes the usual way.
+ */
+bool arm_cpu_do_sync_exception_nobql(CPUState *cs);
+bool arm_cpu_do_sync_exception_nobql(CPUState *cs)
+{
+    ARMCPU *cpu = ARM_CPU(cs);
+    CPUARMState *env = &cpu->env;
+
+    if (!QLIST_EMPTY(&cpu->pre_el_change_hooks) ||
+        !QLIST_EMPTY(&cpu->el_change_hooks) ||
+        cs->exception_index != EXCP_SWI ||
+        !arm_el_is_aa64(env, env->exception.target_el)) {
+        return false;
+    }
+    arm_log_exception(cs);
+    arm_cpu_do_interrupt_aarch64(cs);
+    return true;
+}
+
 uint64_t arm_sctlr(CPUARMState *env, int el)
 {
     /* Only EL0 needs to be adjusted for EL1&0 or EL2&0 or EL3&0 */

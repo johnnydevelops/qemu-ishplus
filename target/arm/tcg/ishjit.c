@@ -2567,6 +2567,7 @@ static void emit_spcheck(IJ *j, vaddr ipc)
  * to the return address, then continues at the vector (emit_continue_or_exit).
  */
 void ishjit_take_exception(CPUARMState *env, uint32_t excp, uint32_t syn);
+bool arm_cpu_do_sync_exception_nobql(CPUState *cs);
 void ishjit_take_exception(CPUARMState *env, uint32_t excp, uint32_t syn)
 {
     CPUState *cs = env_cpu(env);
@@ -2574,6 +2575,10 @@ void ishjit_take_exception(CPUARMState *env, uint32_t excp, uint32_t syn)
     cs->exception_index = excp;
     env->exception.syndrome = syn;
     env->exception.target_el = exception_target_el(env);
+    if (arm_cpu_do_sync_exception_nobql(cs)) {
+        cs->exception_index = -1;
+        return;
+    }
     bql_lock();
     cs->cc->tcg_ops->do_interrupt(cs);
     /*
