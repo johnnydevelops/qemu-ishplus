@@ -21,6 +21,6 @@ extern int (*ishjit_gen_code_hook)(CPUState *cs, TranslationBlock *tb,
 /* The TCG epilogue's TB-exit entry (x0 = TB | exit index) */
 const void *tcg_ishjit_tb_ret_addr(void);
 
-void ishjit_enable(void);
+void ishjit_enable(void *env);    /* (a CPUARMState) */
 
 #endif

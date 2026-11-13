@@ -28,6 +28,7 @@
 #include "tcg/insn-start-words.h"
 #include "accel/tcg/ishjit.h"
 #include "translate.h"
+#include "cpregs.h"
 #include "ishjit-simd.h"
 #include "accel/tcg/tb-jmp-cache.h"
 #include "accel/tcg/tb-hash.h"
@@ -41,6 +42,8 @@ const void *helper_lookup_tb_ptr(CPUArchState *env);
 void helper_exception_with_syndrome(CPUArchState *env, uint32_t excp, uint32_t syn);
 void helper_exception_bkpt_insn(CPUArchState *env, uint32_t syn);
 void helper_exception_return(CPUArchState *env, uint64_t new_pc);
+void helper_msr_i_daifset(CPUArchState *env, uint32_t imm);
+void helper_msr_i_daifclear(CPUArchState *env, uint32_t imm);
 
 /*
  * Registers. Host x18 is Apple's (zeroed on context switches), host SP must
@@ -82,6 +85,8 @@ typedef struct {
     bool rd_written;
     bool reads_flags, writes_flags;
     uint32_t sysoff;            /* (mrs/msr of a plain field: its env offset) */
+    bool spcheck;               /* (sp_el0: UNDEF while it is the stack pointer) */
+    uint64_t sysconst;          /* (mrs of an ARM_CP_CONST register) */
 } OperandInfo;
 
 typedef struct {
@@ -111,6 +116,8 @@ typedef struct {
     bool fp_ok;                 /* FP/SIMD not trapped (FPEXC_EL 0) */
     bool fp_default;            /* FPCR all default: host FP is the guest's */
     bool fgt_active, fgt_svc, trap_eret;
+    bool el2_el3;               /* (the CPU has EL2 or EL3: more access checks) */
+    uint64_t sysconst;          /* (classify_sys: an ARM_CP_CONST's value) */
     uint32_t cur_insn;          /* the guest insn being emitted */
 } IJ;
 
@@ -465,6 +472,86 @@ static void operand_regs(uint32_t insn, const OperandInfo *o,
 static void emit_flags_from_env(IJ *j);
 static void emit_flags_to_env(IJ *j);
 
+
+/*
+ * Shared routines (generated once, after TCG's prologue, so tb_flush keeps
+ * them), instead of copies in every TB: called with the return address in
+ * x27, through their address in env->ishjit_routine[] (any distance).
+ *   R_LOAD: NZCV and every guest register from env (a TB's full entry)
+ *   R_SYNC: every guest register and NZCV to env (leaving ishjit code)
+ *   R_SAVE: as R_SYNC, and x1 = x16 (a slow path's address)
+ *   [3]: a per-vCPU scratch slot
+ */
+enum { ISHJIT_R_LOAD, ISHJIT_R_SYNC, ISHJIT_R_SAVE, ISHJIT_R_SCRATCH };
+static uint64_t ishjit_routine_rx[3];
+
+static void *ishjit_emit_shared(void *code_ptr)
+{
+    IJ jj = { .ptr = code_ptr, .start = code_ptr };
+    IJ *j = &jj;
+
+    ishjit_routine_rx[ISHJIT_R_LOAD] = (uintptr_t)tcg_splitwx_to_rx(j->ptr);
+    emit_flags_from_env(j);
+    for (int g = 0; g < 32; g++) {
+        if (g2h[g] != H_NONE) {
+            emit(j, i_ldr_x(g2h[g], H_ENV, xreg_off(g)));
+        }
+    }
+    emit(j, i_br(H_TMP2));
+
+    for (int r = ISHJIT_R_SYNC; r <= ISHJIT_R_SAVE; r++) {
+        ishjit_routine_rx[r] = (uintptr_t)tcg_splitwx_to_rx(j->ptr);
+        for (int g = 0; g < 32; g++) {
+            if (g2h[g] != H_NONE) {
+                emit(j, i_str_x(g2h[g], H_ENV, xreg_off(g)));
+            }
+        }
+        if (r == ISHJIT_R_SAVE) {
+            emit(j, i_mov_x(1, H_TMP0));
+        }
+        emit_flags_to_env(j);
+        emit(j, i_br(H_TMP2));
+    }
+    return j->ptr;
+}
+
+static void __attribute__((constructor)) ishjit_register(void)
+{
+    tcg_extra_prologue_hook = ishjit_emit_shared;
+}
+
+static unsigned routine_off(int r)
+{
+    return offsetof(CPUARMState, ishjit_routine[r]);
+}
+
+/*
+ * rt = / := *(u64 *)(env + off) for any offset (the scaled 12-bit immediate
+ * reaches 32KB; the routines' slots are further, after the reset fields).
+ * @tmp holds the address when needed (rt itself for a load).
+ */
+static void emit_env_far(IJ *j, bool load, int rt, int tmp, unsigned off)
+{
+    g_assert(off % 8 == 0 && off < (1u << 24));
+    if (off / 8 <= 4095) {
+        emit(j, load ? i_ldr_x(rt, H_ENV, off) : i_str_x(rt, H_ENV, off));
+        return;
+    }
+    emit(j, 0x91400000 | (off >> 12) << 10 | H_ENV << 5 | tmp);   /* add tmp, env, #hi, lsl #12 */
+    emit(j, load ? i_ldr_x(rt, tmp, off & 0xfff) : i_str_x(rt, tmp, off & 0xfff));
+}
+
+/* call a shared routine (through @via: x16, or x17 when x16 is in use) */
+static void emit_call_routine(IJ *j, int r, int via)
+{
+    uint32_t *adr = j->ptr;
+
+    emit(j, 0);                                     /* adr x27, (after the br) */
+    emit_env_far(j, true, via, via, routine_off(r));
+    emit(j, i_br(via));
+    *adr = i_adr(H_TMP2, (j->ptr - adr) * 4);
+}
+
 /* Loads of the guest registers the block uses; NZCV if read first */
 static void emit_block_entry(IJ *j)
 {
@@ -473,12 +560,7 @@ static void emit_block_entry(IJ *j)
      * register keeps its host register and NZCV the host's NZCV; a TB
      * entered otherwise (from cpu_exec or a TCG TB) loads them all.
      */
-    emit_flags_from_env(j);
-    for (int g = 0; g < 32; g++) {
-        if (g2h[g] != H_NONE) {
-            emit(j, i_ldr_x(g2h[g], H_ENV, xreg_off(g)));
-        }
-    }
+    emit_call_routine(j, ISHJIT_R_LOAD, H_TMP0);
 }
 
 /* QEMU's NF/ZF/CF/VF to the host NZCV (uses x16, x17 and the flags) */
@@ -506,12 +588,7 @@ static void emit_flags_from_env(IJ *j)
  */
 static void emit_sync(IJ *j)
 {
-    for (int g = 0; g < 32; g++) {
-        if (g2h[g] != H_NONE) {
-            emit(j, i_str_x(g2h[g], H_ENV, xreg_off(g)));
-        }
-    }
-    emit_flags_to_env(j);
+    emit_call_routine(j, ISHJIT_R_SYNC, H_TMP0);
 }
 
 /* The host NZCV to QEMU's NF/ZF/CF/VF, flags untouched (uses x16, x17) */
@@ -716,10 +793,12 @@ static void emit_lookup(IJ *j)
     emit(j, i_ldr_x(H_TMP1, H_TMP2, offsetof(TranslationBlock, tc.ptr)));
     emit(j, 0x8B000000 | H_TMP0 << 16 | H_TMP1 << 5 | H_TMP1);         /* add x17, x17, x16 */
     emit(j, i_br(H_TMP1));
-    /* a TCG TB: registers stored */
+    /* a TCG TB: registers stored (its code pointer kept across the routine) */
     *to_tcg = 0x34000000 | ((j->ptr - to_tcg) & 0x7ffff) << 5 | H_TMP0;
-    emit_sync(j);
     emit(j, i_ldr_x(H_TMP0, H_TMP2, offsetof(TranslationBlock, tc.ptr)));
+    emit_env_far(j, false, H_TMP0, H_TMP1, routine_off(ISHJIT_R_SCRATCH));
+    emit_sync(j);
+    emit_env_far(j, true, H_TMP0, H_TMP0, routine_off(ISHJIT_R_SCRATCH));
     emit(j, i_br(H_TMP0));
     /* a miss: helper_lookup_tb_ptr */
     for (int k = 0; k < nm; k++) {
@@ -1132,10 +1211,12 @@ void ishjit_atomic_slow(CPUARMState *env, uint64_t addr, uint32_t insn,
 }
 
 enum { K_STOP, K_DP, K_NOP, K_ADR, K_MEM, K_FP, K_COPY, K_CLREX, K_MRS, K_MSR,
-       K_B, K_BL, K_BCOND, K_CB, K_TB, K_BREG, K_SVC, K_BRK, K_ERET, K_ISB };
+       K_MRSCONST,
+       K_B, K_BL, K_BCOND, K_CB, K_TB, K_BREG, K_SVC, K_BRK, K_ERET, K_ISB,
+       K_DAIFSET, K_DAIFCLR };
 
 /* System instructions ishjit handles itself (others: TCG) */
-static int classify_sys(uint32_t insn, const IJ *j, unsigned *off)
+static int classify_sys(uint32_t insn, IJ *j, unsigned *off, bool *spcheck)
 {
     unsigned crm = (insn >> 8) & 15;
 
@@ -1167,6 +1248,13 @@ static int classify_sys(uint32_t insn, const IJ *j, unsigned *off)
     if ((insn & 0xFFFFF0FF) == 0xD503305F) {            /* clrex */
         return K_CLREX;
     }
+    /* interrupt masking (the kernel's local_irq_*): at EL1, no traps */
+    if ((insn & 0xFFFFF0FF) == 0xD50340DF) {            /* msr daifset, #imm */
+        return j->el == 1 ? K_DAIFSET : K_STOP;
+    }
+    if ((insn & 0xFFFFF0FF) == 0xD50340FF) {            /* msr daifclr, #imm */
+        return j->el == 1 ? K_DAIFCLR : K_STOP;
+    }
     if ((insn & 0xFFE0001F) == 0xD4000001) {            /* svc */
         return j->el == 0 && !j->fgt_svc ? K_SVC : K_STOP;
     }
@@ -1176,6 +1264,63 @@ static int classify_sys(uint32_t insn, const IJ *j, unsigned *off)
     if (insn == 0xD69F03E0) {                           /* eret */
         return j->el == 1 && !j->trap_eret ? K_ERET : K_STOP;
     }
+    /*
+     * Other system registers, from QEMU's own table (as TCG's handle_sys):
+     * plain fields read, or written where TCG would not end the TB (no TB
+     * flags depend on them); constants; no-op SYS instructions (cache
+     * maintenance QEMU ignores). Only with an access check known to pass.
+     */
+    if ((insn & 0xFFC00000) == 0xD5000000 && ((insn >> 19) & 3)) {
+        bool isread = insn & (1u << 21);
+        int op0 = (insn >> 19) & 3, op1 = (insn >> 16) & 7, crn = (insn >> 12) & 15;
+        int op2 = (insn >> 5) & 7;
+        uint32_t key = ENCODE_AA64_CP_REG(CP_REG_ARM64_SYSREG_CP, crn, crm, op0, op1, op2);
+        const ARMCPRegInfo *ri = get_arm_cp_reginfo(env_archcpu(j->env)->cp_regs, key);
+        int t;
+
+        if (!ri || !cp_access_ok(j->el, ri, isread) ||
+            (ri->fgt && j->fgt_active)) {
+            goto other;
+        }
+        if (ri->accessfn &&
+            arm_cpreg_ishplus_access(ri, j->el, j->el2_el3) != 1) {
+            goto other;
+        }
+        t = ri->type;
+        if (op0 == 1 && (t & ARM_CP_SPECIAL_MASK) != ARM_CP_NOP) {
+            goto other;                 /* (SYS: only what QEMU ignores) */
+        }
+        if (t & ARM_CP_SPECIAL_MASK) {
+            return (t & ARM_CP_SPECIAL_MASK) == ARM_CP_NOP ? K_NOP : K_STOP;
+        }
+        if (t & (ARM_CP_IO | ARM_CP_RAISES_EXC | ARM_CP_NEWEL | ARM_CP_FPU |
+                 ARM_CP_SVE | ARM_CP_SME)) {
+            goto other;
+        }
+        if (t & ARM_CP_CONST) {
+            if (!isread) {
+                return K_NOP;
+            }
+            *off = 0;
+            j->sysconst = ri->resetvalue;
+            return K_MRSCONST;
+        }
+        if (!ri->fieldoffset) {
+            goto other;
+        }
+        if (ri->fieldoffset % 8 || ri->fieldoffset / 8 > 4095) {
+            goto other;                 /* (beyond a plain ldr/str) */
+        }
+        if (isread && !ri->readfn) {
+            *off = ri->fieldoffset;
+            return K_MRS;
+        }
+        if (!isread && !ri->writefn && (t & ARM_CP_SUPPRESS_TB_END)) {
+            *off = ri->fieldoffset;
+            return K_MSR;
+        }
+    }
+other:
     /* thread pointers (plain fields, no traps without fine-grained traps) */
     if (!j->fgt_active) {
         switch (insn & 0xFFFFFFE0) {
@@ -1191,6 +1336,15 @@ static int classify_sys(uint32_t insn, const IJ *j, unsigned *off)
         case 0xD538D080:                                /* mrs tpidr_el1 */
             *off = offsetof(CPUARMState, cp15.tpidr_el[1]);
             return j->el == 1 ? K_MRS : K_STOP;
+        case 0xD5384100:                                /* mrs sp_el0 */
+        case 0xD5184100:                                /* msr sp_el0 */
+            /* (Linux's current task; accessible at EL1 unless PSTATE.SP 0) */
+            *off = offsetof(CPUARMState, sp_el[0]);
+            *spcheck = true;
+            if (j->el != 1) {
+                return K_STOP;
+            }
+            return (insn & 0x00200000) ? K_MRS : K_MSR;
         }
     }
     return K_STOP;
@@ -1203,7 +1357,7 @@ static int classify_sys(uint32_t insn, const IJ *j, unsigned *off)
  * arithmetic when the FPCR is not all default (the host's is), and
  * saturating ops (FPSR.QC is not folded back from the host yet).
  */
-static bool fp_copyable(uint32_t insn, SimdOperands *g, const IJ *j)
+static bool fp_copyable(uint32_t insn, SimdOperands *g, IJ *j)
 {
     if (!j->fp_ok || (insn & 0x0E000000) != 0x0E000000 ||
         !ishjit_simd_decode(insn, g)) {
@@ -1249,14 +1403,17 @@ static void fp_regs(uint32_t insn, const SimdOperands *g, uint32_t *reads,
 }
 
 static int classify(uint32_t insn, OperandInfo *o, MemInfo *m, bool mem_ok,
-                    bool fp_ok, SimdOperands *g, const IJ *j)
+                    bool fp_ok, SimdOperands *g, IJ *j)
 {
     if ((insn & 0xFF000000) == 0xD5000000 || (insn & 0xFF000000) == 0xD4000000 ||
         insn == 0xD69F03E0) {
         unsigned off = 0;
-        int k = classify_sys(insn, j, &off);
+        bool spcheck = false;
+        int k = classify_sys(insn, j, &off, &spcheck);
 
         o->sysoff = off;
+        o->spcheck = spcheck;
+        o->sysconst = j->sysconst;
         return k;
     }
     if (fp_copyable(insn, g, j)) {
@@ -1609,31 +1766,17 @@ static void emit_mem(IJ *j, const MemInfo *m, vaddr ipc, IJSlow *sl)
  */
 static void emit_save_thunk(IJ *j, bool flags)
 {
-    for (int g = 0; g < 32; g++) {
-        if (g2h[g] != H_NONE) {
-            emit(j, i_str_x(g2h[g], H_ENV, xreg_off(g)));
-        }
-    }
     emit_vstore(j, j->vused);
-    emit(j, i_mov_x(1, H_TMP0));
-    if (flags) {
-        emit_flags_to_env(j);
-    }
-    emit(j, i_br(H_TMP2));
+    /* (x16 is the address: the routine's address in x17) */
+    emit_env_far(j, true, H_TMP1, H_TMP1, routine_off(ISHJIT_R_SAVE));
+    emit(j, i_br(H_TMP1));
 }
 
 static void emit_restore_thunk(IJ *j, bool flags)
 {
-    if (flags) {
-        emit_flags_from_env(j);
-    }
-    for (int g = 0; g < 32; g++) {
-        if (g2h[g] != H_NONE) {
-            emit(j, i_ldr_x(g2h[g], H_ENV, xreg_off(g)));
-        }
-    }
     emit_vload(j, j->vused);
-    emit(j, i_br(H_TMP2));
+    emit_env_far(j, true, H_TMP0, H_TMP0, routine_off(ISHJIT_R_LOAD));
+    emit(j, i_br(H_TMP0));
 }
 
 static const void *ld_helper(int size, bool sign)
@@ -1835,6 +1978,26 @@ static void ishjit_stat(int n, uint32_t stop, bool declined)
     if (stop || n) st_stop[st_class(stop)] += stop || !n ? 1 : 0;
 }
 
+
+/* sp_el0 is UNDEF while PSTATE.SP is 0 (SP_EL0 is the stack pointer) */
+static void emit_spcheck(IJ *j, vaddr ipc)
+{
+    uint32_t *ok;
+
+    emit(j, i_ldr_w(H_TMP1, H_ENV, offsetof(CPUARMState, pstate)));
+    ok = j->ptr;
+    emit(j, 0);                                     /* tbnz w17, #0, ok */
+    emit_vstore(j, j->vwritten);
+    emit_sync(j);
+    emit_pc_add(j, (int64_t)(ipc - j->pc_first));
+    emit(j, i_mov_x(0, H_ENV));
+    emit_movi(j, 1, EXCP_UDEF);
+    emit_movi(j, 2, syn_uncategorized());
+    emit_movi(j, H_TMP0, (uintptr_t)helper_exception_with_syndrome);
+    emit(j, i_blr(H_TMP0));
+    *ok = 0x37000000 | 0 << 19 | ((j->ptr - ok) & 0x3fff) << 5 | H_TMP1;
+}
+
 static int ishjit_gen(CPUState *cs, TranslationBlock *tb, vaddr pc,
                       void *host_pc, int max_insns, void *buf)
 {
@@ -1877,6 +2040,7 @@ static int ishjit_gen(CPUState *cs, TranslationBlock *tb, vaddr pc,
     j->fgt_active = EX_TBFLAG_ANY(tbf, FGT_ACTIVE);
     j->fgt_svc = EX_TBFLAG_ANY(tbf, FGT_SVC);
     j->trap_eret = EX_TBFLAG_A64(tbf, TRAP_ERET);
+    j->el2_el3 = arm_feature(env, ARM_FEATURE_EL2) || arm_feature(env, ARM_FEATURE_EL3);
     static int nomem = -1;
     if (nomem < 0) {
         nomem = getenv("ISHJIT_NOMEM") != NULL;
@@ -1910,6 +2074,7 @@ static int ishjit_gen(CPUState *cs, TranslationBlock *tb, vaddr pc,
             break;
         }
         case K_MRS:
+        case K_MRSCONST:
             wr = (insn & 31) == 31 ? 0 : 1u << (insn & 31);
             break;
         case K_MSR:
@@ -2049,6 +2214,9 @@ static int ishjit_gen(CPUState *cs, TranslationBlock *tb, vaddr pc,
             case K_MRS: {
                 int g = insn & 31;
 
+                if (ops[i].spcheck) {
+                    emit_spcheck(j, ipc);
+                }
                 if (g == 31) {
                     break;
                 }
@@ -2060,10 +2228,26 @@ static int ishjit_gen(CPUState *cs, TranslationBlock *tb, vaddr pc,
                 }
                 break;
             }
+            case K_MRSCONST: {
+                int g = insn & 31;
+
+                if (g != 31) {
+                    int h = g2h[g] == H_NONE ? H_TMP0 : g2h[g];
+
+                    emit_movi(j, h, ops[i].sysconst);
+                    if (g2h[g] == H_NONE) {
+                        emit(j, i_str_x(h, H_ENV, xreg_off(g)));
+                    }
+                }
+                break;
+            }
             case K_MSR: {
                 int g = insn & 31;
                 int h = g == 31 ? 31 : g2h[g];
 
+                if (ops[i].spcheck) {
+                    emit_spcheck(j, ipc);
+                }
                 if (h == H_NONE) {
                     h = H_TMP0;
                     emit(j, i_ldr_x(h, H_ENV, xreg_off(g)));
@@ -2108,6 +2292,35 @@ static int ishjit_gen(CPUState *cs, TranslationBlock *tb, vaddr pc,
             case K_ISB:
                 end_off[i] = ij_offset(j);
                 emit_jump(j, 0, ipc + 4);           /* (ends the TB, as TCG) */
+                break;
+            case K_DAIFSET:
+            case K_DAIFCLR:
+                /*
+                 * QEMU's helper (it may change the TB flags, so the TB ends,
+                 * as TCG's): registers stored first, the call clobbers them
+                 */
+                end_off[i] = ij_offset(j);
+                emit_vstore(j, j->vwritten);
+                emit_sync(j);
+                emit(j, i_mov_x(0, H_ENV));
+                emit_movi(j, 1, (insn >> 8) & 15);
+                emit_movi(j, H_TMP0, (uintptr_t)(kinds[i] == K_DAIFSET ?
+                                                 (void *)helper_msr_i_daifset :
+                                                 (void *)helper_msr_i_daifclear));
+                emit(j, i_blr(H_TMP0));
+                emit_pc_add(j, (int64_t)(ipc + 4 - j->pc_first));
+                if (kinds[i] == K_DAIFSET) {
+                    /* on: a plain (registers-stored) chained jump */
+                    tb->jmp_insn_offset[0] = ij_offset(j);
+                    emit(j, 0x14000000);
+                    emit(j, i_br(H_TMP0));
+                    tb->jmp_reset_offset[0] = ij_offset(j);
+                    emit_exit_tb(j, 0);
+                } else {
+                    /* to cpu_exec, where an interrupt now unmasked is taken */
+                    emit_movi(j, H_TMP0, (uintptr_t)tcg_code_gen_epilogue);
+                    emit(j, i_br(H_TMP0));
+                }
                 break;
             case K_FP: {
                 const SimdOperands *g = &simds[i];
@@ -2345,6 +2558,23 @@ static int ishjit_gen_code(CPUState *cs, TranslationBlock *tb, vaddr pc,
     uint32_t cflags = tb_cflags(tb);
 
     tb->ishjit_fast = 0;                        /* (also when retried) */
+    /*
+     * The shared routines exist once TCG's prologue is generated, after
+     * the CPUs are created: their addresses go to every vCPU (a TB one
+     * translates runs on all) before the first TB.
+     */
+    if (unlikely(!env->ishjit_routine[ISHJIT_R_LOAD])) {
+        CPUState *c;
+
+        g_assert(ishjit_routine_rx[ISHJIT_R_LOAD]);
+        CPU_FOREACH(c) {
+            CPUARMState *e = cpu_env(c);
+
+            for (int r = 0; r < 3; r++) {
+                qatomic_set(&e->ishjit_routine[r], ishjit_routine_rx[r]);
+            }
+        }
+    }
     tb->ishjit_jmp2[0] = tb->ishjit_jmp2[1] = 0;
     if (!host_pc || !is_a64(env) || (pc & 3) ||
         !(cflags & CF_PCREL) ||
@@ -2430,8 +2660,9 @@ static void cd_install(void)
     sigaction(SIGTRAP, &sa, NULL);
 }
 
-void ishjit_enable(void)
+void ishjit_enable(void *envp)
 {
+    (void)envp;                 /* (routines set at the first translation) */
     /* the env offsets the hand-made encodings hold (scaled 12-bit, ldur) */
     QEMU_BUILD_BUG_ON(offsetof(CPUARMState, xregs[31]) / 8 > 4095 ||
                       offsetof(CPUARMState, xregs[0]) % 8);

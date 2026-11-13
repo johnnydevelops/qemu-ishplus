@@ -2057,7 +2057,7 @@ void arm_cpu_finalize_features(ARMCPU *cpu, Error **errp)
                 error_setg(errp, "ishjit=on needs a13=on");
                 return;
             }
-            ishjit_enable();
+            ishjit_enable(&cpu->env);
         }
 #endif
     }

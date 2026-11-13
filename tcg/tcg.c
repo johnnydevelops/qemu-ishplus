@@ -250,6 +250,7 @@ unsigned int tcg_cur_ctxs;
 unsigned int tcg_max_ctxs;
 TCGv_env tcg_env;
 const void *tcg_code_gen_epilogue;
+void *(*tcg_extra_prologue_hook)(void *code_ptr);
 uintptr_t tcg_splitwx_diff;
 
 #if !defined(CONFIG_TCG_INTERPRETER) && !defined(CONFIG_TCG_THREADED_INTERPRETER)
@@ -1609,6 +1610,13 @@ void tcg_prologue_init(void)
     qemu_thread_jit_write();
     /* Generate the prologue.  */
     tcg_target_qemu_prologue(s);
+    /*
+     * iSH+: code a target's own translator shares between its TBs (ishjit),
+     * emitted with the prologue so that tb_flush keeps it
+     */
+    if (tcg_extra_prologue_hook) {
+        s->code_ptr = tcg_extra_prologue_hook(s->code_ptr);
+    }
 
     /* Allow the prologue to put e.g. guest_base into a pool entry.  */
     {

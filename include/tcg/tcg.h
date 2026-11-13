@@ -456,6 +456,8 @@ extern bool tcg_use_softmmu;
 
 extern __thread TCGContext *tcg_ctx;
 extern const void *tcg_code_gen_epilogue;
+/* iSH+: emits code after the prologue at @code_ptr (RW), returns the end */
+extern void *(*tcg_extra_prologue_hook)(void *code_ptr);
 extern uintptr_t tcg_splitwx_diff;
 extern TCGv_env tcg_env;
 

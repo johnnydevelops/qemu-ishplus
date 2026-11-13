@@ -772,6 +772,9 @@ typedef struct CPUArchState {
         CPUARMTBFlags flags;
     } ishplus_hf_cache[4][ISHPLUS_HF_WAYS];
 
+    /* iSH+ ishjit: the shared routines' (RX) addresses (ishjit.c, ISHJIT_R_*) */
+    uint64_t ishjit_routine[4];
+
     /* Fields after this point are preserved across CPU reset. */
 
     /* Internal CPU feature flags.  */
