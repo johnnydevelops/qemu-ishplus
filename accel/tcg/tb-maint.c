@@ -783,6 +783,10 @@ static void do_tb_flush(CPUState *cpu, run_on_cpu_data tb_flush_count)
     tcg_region_reset_all();
     /* XXX: flush processor icache at this point if cache flush is expensive */
     qatomic_inc(&tb_ctx.tb_flush_count);
+    if (getenv("ISHJIT_FLUSHLOG")) {
+        fprintf(stderr, "ISHJIT tb_flush %u at %lld ms\n", tb_ctx.tb_flush_count,
+                (long long)(g_get_monotonic_time() / 1000));
+    }
 
 done:
     mmap_unlock();

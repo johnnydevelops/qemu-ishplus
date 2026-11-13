@@ -292,6 +292,19 @@ static int setjmp_gen_code(CPUArchState *env, TranslationBlock *tb,
 int (*ishjit_gen_code_hook)(CPUState *cs, TranslationBlock *tb, vaddr pc,
                             void *host_pc, int max_insns, void *buf);
 
+FILE *ishjit_pmap_get(void)
+{
+    static FILE *pmap;
+    static int pmap_on = -1;
+
+    if (pmap_on < 0) {
+        const char *f = getenv("ISHJIT_PMAP");
+        pmap = f ? fopen(f, "w") : NULL;
+        pmap_on = pmap != NULL;
+    }
+    return pmap;
+}
+
 TranslationBlock *tb_gen_code(CPUState *cpu,
                               vaddr pc, uint64_t cs_base,
                               uint32_t flags, int cflags)
@@ -455,6 +468,47 @@ TranslationBlock *tb_gen_code(CPUState *cpu,
      * to its first mapping.
      */
     perf_report_code(pc, tb, tcg_splitwx_to_rx(gen_code_buf));
+    {
+        /* iSH+ debugging: ISHJIT_PMAP=file maps generated code to guest pcs */
+        FILE *pmap = ishjit_pmap_get();
+
+        if (pmap) {
+            flockfile(pmap);
+            fprintf(pmap, "T %" PRIxPTR " %x %" PRIx64 " %" PRIx64 " %x %d %d",
+                    (uintptr_t)tb->tc.ptr, gen_code_size, (uint64_t)pc,
+                    (uint64_t)phys_pc, tb->flags, tb->icount,
+                    tb->ishjit_fast);
+            for (int k = 0; k < tb->icount; k++) {
+                fprintf(pmap, " %x", tcg_ctx->gen_insn_end_off[k]);
+            }
+            fputc('\n', pmap);
+            {
+                static unsigned ntb;
+
+                if (++ntb % 1000 == 0) {
+                    fprintf(pmap, "Z %u %lld\n", ntb,
+                            (long long)(g_get_monotonic_time() / 1000));
+                }
+            }
+            {
+                /* ISHJIT_PMAPCODE=hexpc: the code words of TBs at that guest pc */
+                const char *cpc = getenv("ISHJIT_PMAPCODE");
+
+                if (cpc && ((strtoull(cpc, NULL, 16) ^ (uint64_t)pc) & 0xfff) == 0 && !(pc >> 63)) {
+                    fprintf(pmap, "C %" PRIxPTR, (uintptr_t)tb->tc.ptr);
+                    for (int k = 0; k < gen_code_size / 4; k++) {
+                        fprintf(pmap, " %08x", ((uint32_t *)gen_code_buf)[k]);
+                    }
+                    fprintf(pmap, "\nG");
+                    for (int k = 0; k < tb->icount; k++) {
+                        fprintf(pmap, " %08x", ldl_le_p((uint8_t *)host_pc + 4 * k));
+                    }
+                    fputc('\n', pmap);
+                }
+            }
+            funlockfile(pmap);
+        }
+    }
 
     if (qemu_loglevel_mask(CPU_LOG_TB_OUT_ASM) &&
         qemu_log_in_addr_range(pc)) {
