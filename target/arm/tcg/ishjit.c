@@ -1758,7 +1758,10 @@ static void emit_mem(IJ *j, const MemInfo *m, vaddr ipc, IJSlow *sl)
         } else {
             emit_addi(j, H_TMP0, base, m->wb == WB_POST ? 0 : m->imm);
         }
-        emit_tbi(j);
+        /*
+         * (no top-byte-ignore here: a tagged address cannot match a TLB
+         * entry, the slow path removes the tag; the index ignores it)
+         */
     }
     sl->cbnz2 = NULL;
     if (m->akind != A_NONE && m->size) {
@@ -1931,7 +1934,10 @@ static void emit_slow(IJ *j, const IJSlow *sl, uint32_t *save, uint32_t *restore
     if (sl->cbnz2) {
         *sl->cbnz2 = 0xB5000000 | ((j->ptr - sl->cbnz2) & 0x7ffff) << 5 | H_TMP1;
     }
-
+    /* top-byte-ignore, which the fast path leaves out */
+    if (m->mode != M_LIT) {
+        emit_tbi(j);
+    }
     if (m->akind == A_LSE || m->akind == A_CAS || m->akind == A_LDX ||
         m->akind == A_STX) {
         emit(j, i_adr(H_TMP2, 8));
@@ -2338,12 +2344,17 @@ static int ishjit_gen(CPUState *cs, TranslationBlock *tb, vaddr pc,
         uint32_t *tbnz;
 
         emit_block_entry(j);
-        tb->ishjit_fast = ij_offset(j);
-        emit(j, i_ldur_w(H_TMP0, H_ENV, off));
-        /* tbz w16, #31, +8; b exit (a TB can be beyond tbnz's 32KB reach) */
-        emit(j, 0x36000000 | 31 << 19 | 2 << 5 | H_TMP0);
+        /*
+         * A near stub to the far exit (a TB can be beyond tbnz's 32KB
+         * reach), jumped over by the full entry, so that the fast entry's
+         * check is a single tbnz
+         */
+        emit(j, i_b(2));
         tbnz = j->ptr;
         emit(j, 0);                             /* b exit */
+        tb->ishjit_fast = ij_offset(j);
+        emit(j, i_ldur_w(H_TMP0, H_ENV, off));
+        emit(j, 0x37000000 | 31 << 19 | ((tbnz - j->ptr) & 0x3fff) << 5 | H_TMP0);
         emit_checkenv(j, 1);
         emit_vload(j, j->vused);
         /* (the exit it jumps to is placed after the block's code) */
@@ -2599,7 +2610,7 @@ static int ishjit_gen(CPUState *cs, TranslationBlock *tb, vaddr pc,
                 /* the TB's guest pc is env->pc on entry */
                 emit(j, i_ldr_x(h, H_ENV, offsetof(CPUARMState, pc)));
                 if (insn & (1u << 31)) {        /* adrp */
-                    val = (ipc & TARGET_PAGE_MASK) + (imm << 12);
+                    val = (ipc & ~(vaddr)0xfff) + (imm << 12);   /* (4 KB, whatever the page size) */
                 } else {
                     val = ipc + imm;
                 }
