@@ -270,6 +270,11 @@ typedef struct CPUArchState {
     /* Regs for A64 mode.  */
     uint64_t xregs[32];
     uint64_t pc;
+    /*
+     * iSH+ ishjit: shared TLB checks, per group of accesses through one
+     * base register in a TB: the base's host address, or 0 (softmmu way)
+     */
+    uint64_t ishjit_gslot[8];
     /* PSTATE isn't an architectural register for ARMv8. However, it is
      * convenient for us to assemble the underlying state into a 32 bit format
      * identical to the architectural format used for the SPSR. (This is also

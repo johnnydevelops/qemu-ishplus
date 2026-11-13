@@ -121,6 +121,10 @@ typedef struct {
     bool fp_default;            /* FPCR all default: host FP is the guest's */
     bool fgt_active, fgt_svc, trap_eret;
     bool unpriv;                /* TB flag UNPRIV: ldtr/sttr use the user index */
+    /* shared TLB checks (emit_mem): this access's role, its group's slot and span */
+    int g_role;                 /* 0 none, 1 the group's first, 2 a later one */
+    int g_slot, g_min, g_span;
+    bool g_store;
     bool el2_el3;               /* (the CPU has EL2 or EL3: more access checks) */
     uint64_t sysconst;          /* (classify_sys: an ARM_CP_CONST's value) */
     uint32_t cur_insn;          /* the guest insn being emitted */
@@ -1584,6 +1588,10 @@ typedef struct {
     bool flags;             /* NZCV valid in the host at this insn */
     bool allslow;           /* (debugging: always the slow path) */
     uint32_t *cbnz2;        /* (atomics: the alignment check's cbnz x17) */
+    int gkind;              /* (shared checks: 1 first, 2 later; out of line: the softmmu way) */
+    uint32_t *gbr;          /* (its branch there) */
+    int gslot;
+    vaddr ipc;
 } IJSlow;
 
 /* Top-byte-ignore of data addresses (TCG's clean_data_tbi), on x16 */
@@ -1728,13 +1736,9 @@ static void emit_atomic_access(IJ *j, const MemInfo *m, int accsize)
  * QEMU's softmmu TLB that leaves the flags alone, then the access itself on
  * the host address. Misses go to a slow path (after the block).
  */
-static void emit_mem(IJ *j, const MemInfo *m, vaddr ipc, IJSlow *sl)
+/* The access's first byte to x16 (from its base and offset registers) */
+static void emit_addr(IJ *j, const MemInfo *m, vaddr ipc)
 {
-    int accsize = (1 << m->size) * (m->pair ? 2 : 1);
-    unsigned pb = j->page_bits;
-    int cmp_off = m->load ? offsetof(CPUTLBEntry, addr_read)
-                          : offsetof(CPUTLBEntry, addr_write);
-
     if (m->mode == M_LIT) {
         emit(j, i_ldr_x(H_TMP0, H_ENV, offsetof(CPUARMState, pc)));
         emit_addi(j, H_TMP0, H_TMP0, (int64_t)(ipc + m->imm - j->pc_first));
@@ -1763,42 +1767,11 @@ static void emit_mem(IJ *j, const MemInfo *m, vaddr ipc, IJSlow *sl)
          * entry, the slow path removes the tag; the index ignores it)
          */
     }
-    sl->cbnz2 = NULL;
-    if (m->akind != A_NONE && m->size) {
-        /* atomics, exclusives, ordered: naturally aligned (else the slow path) */
-        emit(j, 0x92400000 | (m->size - 1) << 10 | H_TMP0 << 5 | H_TMP1);  /* and x17, x16, #(size-1) */
-        sl->cbnz2 = j->ptr;
-        emit(j, 0);
-    }
-    if (m->akind == A_LSE || m->akind == A_CAS || m->akind == A_STX) {
-        cmp_off = offsetof(CPUTLBEntry, addr_write);
-    }
+}
 
-    /*
-     * The entry of the first byte's page (x27), compared (rotated: its flag
-     * bits on top) with the page of the last byte: an access crossing pages
-     * misses, as in TCG. x16 = the last byte from here on.
-     */
-    emit(j, 0xA9400000 | ((tlb_fast_off(m->midx) / 8) & 0x7f) << 15 |
-            H_TMP2 << 10 | H_ENV << 5 | H_TMP1);            /* ldp x17, x27, [env, #fast] */
-    emit(j, 0x8A000000 | 1 << 22 | H_TMP0 << 16 | (pb - CPU_TLB_ENTRY_BITS) << 10 |
-            H_TMP1 << 5 | H_TMP1);                          /* and x17, x17, x16, lsr #.. */
-    emit(j, 0x8B000000 | H_TMP1 << 16 | H_TMP2 << 5 | H_TMP2);  /* add x27, x27, x17 */
-    if (accsize > 1) {
-        emit_addi(j, H_TMP0, H_TMP0, accsize - 1);
-    }
-    emit(j, i_ldr_x(H_TMP1, H_TMP2, cmp_off));
-    emit(j, i_ldr_x(H_TMP2, H_TMP2, offsetof(CPUTLBEntry, addend)));
-    emit(j, 0x93C00000 | H_TMP1 << 16 | pb << 10 | H_TMP1 << 5 | H_TMP1);  /* ror x17, x17, #pb */
-    emit(j, 0xCA000000 | 1 << 22 | H_TMP0 << 16 | pb << 10 |
-            H_TMP1 << 5 | H_TMP1);                          /* eor x17, x17, x16, lsr #pb */
-    sl->cbnz = j->ptr;
-    emit(j, 0);                                             /* cbnz x17, slow */
-    if (getenv("ISHJIT_ALLSLOW")) {
-        sl->allslow = true;
-    }
-    emit(j, 0x8B000000 | H_TMP0 << 16 | H_TMP2 << 5 | H_TMP2);  /* add x27, x27, x16 */
-
+/* The access itself, x27 the host address of its last byte */
+static void emit_access(IJ *j, const MemInfo *m, int accsize)
+{
     if (m->akind != A_NONE) {
         emit_atomic_access(j, m, accsize);
     } else if (m->vec && !m->pair) {
@@ -1861,6 +1834,126 @@ static void emit_mem(IJ *j, const MemInfo *m, vaddr ipc, IJSlow *sl)
             }
         }
     }
+}
+
+/* The inline TLB check of x16 (its miss: sl's slow path), then the access */
+static void emit_tlb_access(IJ *j, const MemInfo *m, IJSlow *sl, int accsize)
+{
+    unsigned pb = j->page_bits;
+    int cmp_off = m->load ? offsetof(CPUTLBEntry, addr_read)
+                          : offsetof(CPUTLBEntry, addr_write);
+
+    sl->cbnz2 = NULL;
+    if (m->akind != A_NONE && m->size) {
+        /* atomics, exclusives, ordered: naturally aligned (else the slow path) */
+        emit(j, 0x92400000 | (m->size - 1) << 10 | H_TMP0 << 5 | H_TMP1);  /* and x17, x16, #(size-1) */
+        sl->cbnz2 = j->ptr;
+        emit(j, 0);
+    }
+    if (m->akind == A_LSE || m->akind == A_CAS || m->akind == A_STX) {
+        cmp_off = offsetof(CPUTLBEntry, addr_write);
+    }
+
+    /*
+     * The entry of the first byte's page (x27), compared (rotated: its flag
+     * bits on top) with the page of the last byte: an access crossing pages
+     * misses, as in TCG. x16 = the last byte from here on.
+     */
+    emit(j, 0xA9400000 | ((tlb_fast_off(m->midx) / 8) & 0x7f) << 15 |
+            H_TMP2 << 10 | H_ENV << 5 | H_TMP1);            /* ldp x17, x27, [env, #fast] */
+    emit(j, 0x8A000000 | 1 << 22 | H_TMP0 << 16 | (pb - CPU_TLB_ENTRY_BITS) << 10 |
+            H_TMP1 << 5 | H_TMP1);                          /* and x17, x17, x16, lsr #.. */
+    emit(j, 0x8B000000 | H_TMP1 << 16 | H_TMP2 << 5 | H_TMP2);  /* add x27, x27, x17 */
+    if (accsize > 1) {
+        emit_addi(j, H_TMP0, H_TMP0, accsize - 1);
+    }
+    emit(j, i_ldr_x(H_TMP1, H_TMP2, cmp_off));
+    emit(j, i_ldr_x(H_TMP2, H_TMP2, offsetof(CPUTLBEntry, addend)));
+    emit(j, 0x93C00000 | H_TMP1 << 16 | pb << 10 | H_TMP1 << 5 | H_TMP1);  /* ror x17, x17, #pb */
+    emit(j, 0xCA000000 | 1 << 22 | H_TMP0 << 16 | pb << 10 |
+            H_TMP1 << 5 | H_TMP1);                          /* eor x17, x17, x16, lsr #pb */
+    sl->cbnz = j->ptr;
+    emit(j, 0);                                             /* cbnz x17, slow */
+    if (getenv("ISHJIT_ALLSLOW")) {
+        sl->allslow = true;
+    }
+    emit(j, 0x8B000000 | H_TMP0 << 16 | H_TMP2 << 5 | H_TMP2);  /* add x27, x27, x16 */
+
+    emit_access(j, m, accsize);
+}
+
+/*
+ * A grouped access's out-of-line part: the softmmu way (the group's check
+ * missed, or its slot is 0); the first access also clears the slot
+ */
+static void emit_group_cold(IJ *j, IJSlow *sl)
+{
+    const MemInfo *m = &sl->m;
+    int accsize = (1 << m->size) * (m->pair ? 2 : 1);
+
+    *sl->gbr |= ((j->ptr - sl->gbr) & 0x7ffff) << 5;
+    if (sl->gkind == 1) {
+        emit(j, i_str_x(31, H_ENV, offsetof(CPUARMState, ishjit_gslot[sl->gslot])));  /* (xzr) */
+    }
+    emit_addr(j, m, sl->ipc);
+    emit_tlb_access(j, m, sl, accsize);
+    emit(j, i_b(sl->resume - j->ptr));
+}
+
+static void emit_mem(IJ *j, const MemInfo *m, vaddr ipc, IJSlow *sl)
+{
+    int accsize = (1 << m->size) * (m->pair ? 2 : 1);
+
+    sl->gkind = 0;
+    if (j->g_role == 1) {
+        /*
+         * The group's first access: one TLB check for the whole span of the
+         * group's accesses (one page), the base's host address to its slot
+         */
+        unsigned pb = j->page_bits;
+        int cmp_off = j->g_store ? offsetof(CPUTLBEntry, addr_write)
+                                 : offsetof(CPUTLBEntry, addr_read);
+        int base = g2h[m->rn];
+        unsigned soff = offsetof(CPUARMState, ishjit_gslot[j->g_slot]);
+
+        if (base == H_NONE) {
+            emit(j, i_ldr_x(H_TMP0, H_ENV, xreg_off(m->rn)));
+            base = H_TMP0;
+        }
+        emit_addi(j, H_TMP0, base, j->g_min);
+        emit(j, 0xA9400000 | ((tlb_fast_off(m->midx) / 8) & 0x7f) << 15 |
+                H_TMP2 << 10 | H_ENV << 5 | H_TMP1);        /* ldp x17, x27, [env, #fast] */
+        emit(j, 0x8A000000 | 1 << 22 | H_TMP0 << 16 | (pb - CPU_TLB_ENTRY_BITS) << 10 |
+                H_TMP1 << 5 | H_TMP1);                      /* and x17, x17, x16, lsr #.. */
+        emit(j, 0x8B000000 | H_TMP1 << 16 | H_TMP2 << 5 | H_TMP2);  /* add x27, x27, x17 */
+        emit_addi(j, H_TMP0, H_TMP0, j->g_span - 1);
+        emit(j, i_ldr_x(H_TMP1, H_TMP2, cmp_off));
+        emit(j, i_ldr_x(H_TMP2, H_TMP2, offsetof(CPUTLBEntry, addend)));
+        emit(j, 0x93C00000 | H_TMP1 << 16 | pb << 10 | H_TMP1 << 5 | H_TMP1);  /* ror x17, x17, #pb */
+        emit(j, 0xCA000000 | 1 << 22 | H_TMP0 << 16 | pb << 10 |
+                H_TMP1 << 5 | H_TMP1);                      /* eor x17, x17, x16, lsr #pb */
+        sl->gbr = j->ptr;
+        emit(j, 0xB5000000 | H_TMP1);                       /* cbnz x17, out of line */
+        emit(j, 0x8B000000 | H_TMP0 << 16 | H_TMP2 << 5 | H_TMP2);  /* add x27, x27, x16 */
+        emit_addi(j, H_TMP2, H_TMP2, -(int64_t)(j->g_span - 1) - j->g_min);
+        emit(j, i_str_x(H_TMP2, H_ENV, soff));
+        emit_addi(j, H_TMP2, H_TMP2, m->imm + accsize - 1);
+        emit_access(j, m, accsize);
+        sl->gkind = 1;
+    } else if (j->g_role == 2) {
+        /* a later access of the group: through the slot (0: the softmmu way) */
+        emit(j, i_ldr_x(H_TMP2, H_ENV, offsetof(CPUARMState, ishjit_gslot[j->g_slot])));
+        sl->gbr = j->ptr;
+        emit(j, 0xB4000000 | H_TMP2);                       /* cbz x27, out of line */
+        emit_addi(j, H_TMP2, H_TMP2, m->imm + accsize - 1);
+        emit_access(j, m, accsize);
+        sl->gkind = 2;
+    } else {
+        emit_addr(j, m, ipc);
+        emit_tlb_access(j, m, sl, accsize);
+    }
+    sl->gslot = j->g_slot;
+    sl->ipc = ipc;
     sl->resume = j->ptr;
 
     if (m->wb != WB_NONE) {
@@ -2186,6 +2279,12 @@ static int ishjit_gen(CPUState *cs, TranslationBlock *tb, vaddr pc,
     SimdOperands simds[TCG_MAX_INSNS];
     IJSlow slows[TCG_MAX_INSNS];
     bool fwritten[TCG_MAX_INSNS];       /* NZCV written by an earlier insn */
+    uint32_t written[TCG_MAX_INSNS];    /* (each insn's written registers) */
+    int16_t glead[TCG_MAX_INSNS];        /* (shared checks: the group's first access, or -1) */
+    int8_t gslot[TCG_MAX_INSNS];
+    int64_t gmin[TCG_MAX_INSNS], gend[TCG_MAX_INSNS];
+    int gspan[TCG_MAX_INSNS];
+    bool gstore[TCG_MAX_INSNS];
     int kinds[TCG_MAX_INSNS];
     int n = 0, last;
     CPUARMTBFlags tbf = arm_tbflags_from_tb(tb);
@@ -2317,6 +2416,7 @@ static int ishjit_gen(CPUState *cs, TranslationBlock *tb, vaddr pc,
         }
         j->used |= rd | wr;
         j->written |= wr;
+        written[n] = wr;
         n++;
         if (k >= K_B) {
             break;                              /* a branch ends the block */
@@ -2367,6 +2467,74 @@ static int ishjit_gen(CPUState *cs, TranslationBlock *tb, vaddr pc,
         tb->jmp_insn_offset[1] = TB_JMP_OFFSET_INVALID;
         tb->jmp_reset_offset[0] = TB_JMP_OFFSET_INVALID;
         tb->jmp_reset_offset[1] = TB_JMP_OFFSET_INVALID;
+
+        /*
+         * Shared TLB checks: accesses through the same base register, its
+         * value unchanged in between (only data processing, FP/SIMD and
+         * other accesses between them), immediate offsets, no writeback:
+         * up to 8 groups, each within 4 KB
+         */
+        {
+            static int nogroup = -1;
+            int ngroups = 0;
+
+            if (nogroup < 0) {
+                nogroup = getenv("ISHJIT_NOGROUP") != NULL;
+            }
+            for (int i = 0; i < n; i++) {
+                const MemInfo *m = &mems[i];
+                int acc = (1 << m->size) * (m->pair ? 2 : 1);
+
+                glead[i] = -1;
+                if (nogroup || kinds[i] != K_MEM || m->akind != A_NONE ||
+                    m->mode != M_IMM || m->wb != WB_NONE) {
+                    continue;
+                }
+                for (int q = i - 1; q >= 0; q--) {
+                    const MemInfo *mq = &mems[q];
+
+                    if ((written[q] >> m->rn & 1) ||
+                        (kinds[q] != K_DP && kinds[q] != K_MEM && kinds[q] != K_FP &&
+                         kinds[q] != K_NOP && kinds[q] != K_ADR)) {
+                        break;
+                    }
+                    if (kinds[q] == K_MEM && mq->akind == A_NONE && mq->mode == M_IMM &&
+                        mq->wb == WB_NONE && mq->rn == m->rn && mq->midx == m->midx) {
+                        int L = glead[q];
+                        int64_t lo, hi;
+
+                        if (L < 0) {
+                            if (ngroups == ARRAY_SIZE(((CPUARMState *)0)->ishjit_gslot)) {
+                                break;
+                            }
+                            L = q;
+                            gmin[L] = mq->imm;
+                            gend[L] = mq->imm + (1 << mq->size) * (mq->pair ? 2 : 1);
+                            gstore[L] = !mq->load;
+                        }
+                        lo = MIN(gmin[L], m->imm);
+                        hi = MAX(gend[L], m->imm + acc);
+                        if (hi - lo > 4096) {
+                            break;
+                        }
+                        if (glead[q] < 0) {
+                            glead[q] = q;
+                            gslot[q] = ngroups++;
+                        }
+                        gmin[L] = lo;
+                        gend[L] = hi;
+                        gstore[L] |= !m->load;
+                        glead[i] = L;
+                        break;
+                    }
+                }
+            }
+            for (int i = 0; i < n; i++) {
+                if (glead[i] == i) {
+                    gspan[i] = gend[i] - gmin[i];
+                }
+            }
+        }
 
         for (int i = 0; i < n; i++) {
             uint32_t insn = insns[i];
@@ -2557,6 +2725,11 @@ static int ishjit_gen(CPUState *cs, TranslationBlock *tb, vaddr pc,
                 slows[j->nslow].allslow = false;
                 slows[j->nslow].insn = insn;
                 slows[j->nslow].flags = true;   /* (NZCV always live) */
+                j->g_role = glead[i] < 0 ? 0 : glead[i] == i ? 1 : 2;
+                j->g_slot = glead[i] < 0 ? 0 : gslot[glead[i]];
+                j->g_min = glead[i] < 0 ? 0 : gmin[glead[i]];
+                j->g_span = glead[i] < 0 ? 0 : gspan[glead[i]];
+                j->g_store = glead[i] >= 0 && gstore[glead[i]];
                 emit_mem(j, &mems[i], ipc, &slows[j->nslow]);
                 j->nslow++;
                 break;
@@ -2716,6 +2889,9 @@ static int ishjit_gen(CPUState *cs, TranslationBlock *tb, vaddr pc,
             for (int k = 0; k < j->nslow; k++) {
                 if ((uint8_t *)j->ptr + 1024 > j->highwater) {
                     return -1;
+                }
+                if (slows[k].gkind) {
+                    emit_group_cold(j, &slows[k]);
                 }
                 emit_slow(j, &slows[k], save[slows[k].flags],
                           restore[slows[k].flags]);
