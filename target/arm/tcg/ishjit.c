@@ -1883,6 +1883,105 @@ static void emit_tlb_access(IJ *j, const MemInfo *m, IJSlow *sl, int accsize)
 }
 
 /*
+ * The access at [x27, #off] (x27 the host address of the base), the offset
+ * in the instruction; false if it does not fit (then: emit_access)
+ */
+static bool emit_access_off(IJ *j, const MemInfo *m, int64_t off)
+{
+    int esz = 1 << m->size;                         /* (one register's bytes) */
+    bool scaled = off >= 0 && off % esz == 0 && off / esz < 4096;
+    bool unscaled = off >= -256 && off <= 255;
+    bool p7 = off % esz == 0 && off / esz >= -64 && off / esz <= 63;
+
+    if (m->akind != A_NONE) {
+        return false;
+    }
+    if (m->vec && !m->pair) {
+        unsigned sz = m->size == 4 ? 0 : m->size;
+        unsigned opcv = (m->size == 4 ? 2 : 0) | m->load;
+
+        if (scaled) {           /* ldr/str Vt, [x27, #off] */
+            emit(j, sz << 30 | 0x3D000000 | opcv << 22 | (off / esz) << 10 |
+                    H_TMP2 << 5 | m->rt);
+        } else if (unscaled) {  /* ldur/stur */
+            emit(j, sz << 30 | 0x3C000000 | opcv << 22 | (off & 0x1ff) << 12 |
+                    H_TMP2 << 5 | m->rt);
+        } else {
+            return false;
+        }
+        return true;
+    }
+    if (m->vec) {
+        if (!p7) {
+            return false;
+        }
+        /* ldp/stp St/Dt/Qt, [x27, #off] */
+        emit(j, (m->size - 2) << 30 | 0x2D000000 | (m->load ? 1 << 22 : 0) |
+                ((off / esz) & 0x7f) << 15 | m->rt2 << 10 | H_TMP2 << 5 | m->rt);
+        return true;
+    }
+    if (!m->pair) {
+        int rt = m->rt == 31 ? 31 : g2h[m->rt];
+        bool in_env = rt == H_NONE;
+        uint32_t op;
+
+        if (scaled) {
+            op = m->size << 30 | 0x39000000 | m->opc << 22 | (off / esz) << 10;
+        } else if (unscaled) {
+            op = m->size << 30 | 0x38000000 | m->opc << 22 | (off & 0x1ff) << 12;
+        } else {
+            return false;
+        }
+        if (in_env) {
+            rt = H_TMP1;
+            if (!m->load) {
+                emit(j, i_ldr_x(rt, H_ENV, xreg_off(m->rt)));
+            }
+        }
+        emit(j, op | H_TMP2 << 5 | rt);
+        if (in_env && m->load) {
+            emit(j, i_str_x(rt, H_ENV, xreg_off(m->rt)));
+        }
+        return true;
+    }
+    if (!p7) {
+        return false;
+    }
+    {
+        int rt = m->rt == 31 ? 31 : g2h[m->rt];
+        int rt2 = m->rt2 == 31 ? 31 : g2h[m->rt2];
+        bool e1 = rt == H_NONE, e2 = rt2 == H_NONE;
+
+        if (e1) {
+            rt = H_TMP0;
+        }
+        if (e2) {
+            rt2 = H_TMP1;
+        }
+        if (!m->load) {
+            if (e1) {
+                emit(j, i_ldr_x(rt, H_ENV, xreg_off(m->rt)));
+            }
+            if (e2) {
+                emit(j, i_ldr_x(rt2, H_ENV, xreg_off(m->rt2)));
+            }
+        }
+        /* ldp/stp/ldpsw rt, rt2, [x27, #off] */
+        emit(j, m->opc << 30 | 0x29000000 | (m->load ? 1 << 22 : 0) |
+                ((off / esz) & 0x7f) << 15 | rt2 << 10 | H_TMP2 << 5 | rt);
+        if (m->load) {
+            if (e1) {
+                emit(j, i_str_x(rt, H_ENV, xreg_off(m->rt)));
+            }
+            if (e2) {
+                emit(j, i_str_x(rt2, H_ENV, xreg_off(m->rt2)));
+            }
+        }
+        return true;
+    }
+}
+
+/*
  * A grouped access's out-of-line part: the softmmu way (the group's check
  * missed, or its slot is 0); the first access also clears the slot
  */
@@ -1937,16 +2036,20 @@ static void emit_mem(IJ *j, const MemInfo *m, vaddr ipc, IJSlow *sl)
         emit(j, 0x8B000000 | H_TMP0 << 16 | H_TMP2 << 5 | H_TMP2);  /* add x27, x27, x16 */
         emit_addi(j, H_TMP2, H_TMP2, -(int64_t)(j->g_span - 1) - j->g_min);
         emit(j, i_str_x(H_TMP2, H_ENV, soff));
-        emit_addi(j, H_TMP2, H_TMP2, m->imm + accsize - 1);
-        emit_access(j, m, accsize);
+        if (!emit_access_off(j, m, m->imm)) {
+            emit_addi(j, H_TMP2, H_TMP2, m->imm + accsize - 1);
+            emit_access(j, m, accsize);
+        }
         sl->gkind = 1;
     } else if (j->g_role == 2) {
         /* a later access of the group: through the slot (0: the softmmu way) */
         emit(j, i_ldr_x(H_TMP2, H_ENV, offsetof(CPUARMState, ishjit_gslot[j->g_slot])));
         sl->gbr = j->ptr;
         emit(j, 0xB4000000 | H_TMP2);                       /* cbz x27, out of line */
-        emit_addi(j, H_TMP2, H_TMP2, m->imm + accsize - 1);
-        emit_access(j, m, accsize);
+        if (!emit_access_off(j, m, m->imm)) {
+            emit_addi(j, H_TMP2, H_TMP2, m->imm + accsize - 1);
+            emit_access(j, m, accsize);
+        }
         sl->gkind = 2;
     } else {
         emit_addr(j, m, ipc);
