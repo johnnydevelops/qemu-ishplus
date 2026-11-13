@@ -2195,6 +2195,19 @@ static void qemu_create_machine(QDict *qdict)
     object_property_add_child(machine_get_container("unattached"),
                               "sysbus", OBJECT(sysbus_get_default()));
 
+    if (qdict_haskey(qdict, "ishplus-pagebits")) {
+        /* iSH+: see ishplus_page_bits_floor (not a machine property) */
+        ishplus_page_bits_floor = qdict_get_try_int(qdict, "ishplus-pagebits", 0);
+        if (!qdict_get_try_int(qdict, "ishplus-pagebits", 0)) {
+            ishplus_page_bits_floor = atoi(qdict_get_try_str(qdict, "ishplus-pagebits") ?: "0");
+        }
+        qdict_del(qdict, "ishplus-pagebits");
+        if (ishplus_page_bits_floor &&
+            (ishplus_page_bits_floor < 12 || ishplus_page_bits_floor > 16)) {
+            error_report("ishplus-pagebits must be 12 to 16");
+            exit(1);
+        }
+    }
     if (machine_class->minimum_page_bits) {
         if (!set_preferred_target_page_bits(machine_class->minimum_page_bits)) {
             /* This would be a board error: specifying a minimum smaller than

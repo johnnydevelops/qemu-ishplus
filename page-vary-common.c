@@ -26,8 +26,13 @@
 
 TargetPageBits target_page;
 
+int ishplus_page_bits_floor;
+
 bool set_preferred_target_page_bits_common(int bits)
 {
+    if (bits < ishplus_page_bits_floor) {
+        bits = ishplus_page_bits_floor;
+    }
     /*
      * The target page size is the lowest common denominator for all
      * the CPUs in the system, so we can only make it smaller, never

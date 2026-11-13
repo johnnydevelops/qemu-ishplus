@@ -26,6 +26,14 @@ typedef struct {
     uint64_t mask;
 } TargetPageBits;
 
+/*
+ * iSH+: a floor for the target page size (0: none), for a guest kernel
+ * that only uses larger pages (-M ...,ishplus-pagebits=14 for 16 KB): fewer
+ * TLB entries and fills. Smaller guest pages stay correct (cputlb repeats
+ * the translation on every access to them), only slow.
+ */
+extern int ishplus_page_bits_floor;
+
 #ifdef IN_PAGE_VARY
 bool set_preferred_target_page_bits_common(int bits);
 void finalize_target_page_bits_common(int min);
