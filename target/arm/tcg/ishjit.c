@@ -131,11 +131,59 @@ typedef struct {
     /* (branches to the TB's jumps to R_PCSYNC, R_EXITTB, emitted at its end) */
     uint32_t *pend_pcsync[8], *pend_exit[8];
     int npcsync, nexit;
+    /*
+     * Cold code (slow paths, exit paths, the full entry) goes to a separate
+     * buffer while translating, then below the TB's struct at the region's
+     * top, away from the hot code: branches between the two are fixed up
+     */
+    bool in_cold;
+    uint32_t *hot_save, *cptr;
+    uint32_t *jmp2_c[2], *jmp2r_c[2];
 } IJ;
+
+#define IJ_COLD_MAX (64 * 1024 / 4)
+#define IJ_HIGHWATER 1024   /* (TCG's TCG_HIGHWATER) */
+static __thread uint32_t ij_cold_buf[IJ_COLD_MAX + 1024];
+enum { FX_H2C, FX_C2H, FX_C2H_REL };
+typedef struct { int kind; uint32_t *at, *to, *base; } IJFix;
+#define IJ_NFIX 4096
+static __thread IJFix ij_fix[IJ_NFIX];
+static __thread int ij_nfix;
+
+static void ij_to_cold(IJ *j)
+{
+    g_assert(!j->in_cold);
+    j->hot_save = j->ptr;
+    j->ptr = j->cptr;
+    j->in_cold = true;
+}
+
+static void ij_to_hot(IJ *j)
+{
+    g_assert(j->in_cold);
+    j->cptr = j->ptr;
+    j->ptr = j->hot_save;
+    j->in_cold = false;
+}
+
+static void ij_fixup(int kind, uint32_t *at, uint32_t *to, uint32_t *base)
+{
+    g_assert(ij_nfix < IJ_NFIX);
+    ij_fix[ij_nfix++] = (IJFix){ kind, at, to, base };
+}
+
 
 static inline void emit(IJ *j, uint32_t insn)
 {
     *j->ptr++ = insn;
+}
+
+/* (hot code) b @cold */
+static void emit_b_cold(IJ *j, uint32_t *cold)
+{
+    g_assert(!j->in_cold);
+    ij_fixup(FX_H2C, j->ptr, cold, NULL);
+    emit(j, 0);
 }
 
 static inline intptr_t ij_offset(IJ *j)
@@ -148,7 +196,7 @@ static __thread struct { uint32_t o0, o1; char k; } ij_reg[4096];
 static __thread int ij_nreg;
 static inline void ij_region(IJ *j, intptr_t o0, char k)
 {
-    if (ij_nreg < 4096) {
+    if (ij_nreg < 4096 && !j->in_cold) {
         ij_reg[ij_nreg].o0 = o0;
         ij_reg[ij_nreg].o1 = ij_offset(j);
         ij_reg[ij_nreg].k = k;
@@ -843,17 +891,29 @@ static void emit_pc_set(IJ *j, vaddr target)
     emit(j, i_str_x(H_TMP0, H_ENV, offsetof(CPUARMState, pc)));
 }
 
+/* rd = this TB's struct (RX address) + @add: adr when in reach, else movz/movk */
+static void emit_tb_addr(IJ *j, int rd, unsigned add)
+{
+    intptr_t d = (uint8_t *)j->tb + add - (uint8_t *)j->ptr;
+
+    if (!j->in_cold && d == sextract64(d, 0, 21)) {
+        emit(j, i_adr(rd, d));
+    } else {
+        emit_movi(j, rd, (uintptr_t)tcg_splitwx_to_rx(j->tb) + add);
+    }
+}
+
 static void emit_exit_tb(IJ *j, unsigned idx)
 {
     const void *ret = tcg_ishjit_tb_ret_addr();
     uintptr_t here;
     ptrdiff_t off;
 
-    /* x0 = the TB | idx (the TB's struct is right before its code) */
-    emit(j, i_adr(0, (uint8_t *)j->tb + idx - (uint8_t *)j->ptr));
+    /* x0 = the TB | idx */
+    emit_tb_addr(j, 0, idx);
     here = (uintptr_t)tcg_splitwx_to_rx(j->ptr);
     off = ((uintptr_t)ret - here) >> 2;
-    if (off == sextract64(off, 0, 26)) {
+    if (!j->in_cold && off == sextract64(off, 0, 26)) {
         emit(j, 0x14000000 | (off & 0x3ffffff));
     } else {
         g_assert(j->nexit < 8);
@@ -886,11 +946,20 @@ static void emit_goto_tb(IJ *j, int which, vaddr dest)
     emit(j, 0x14000000);                    /* b . (patched) */
     emit(j, i_br(H_TMP0));                  /* (when patched to ldr x16) */
     j->tb->jmp_reset_offset[which] = ij_offset(j);
-    emit_pcsync(j, dest);
-    j->tb->ishjit_jmp2[which] = ij_offset(j);
-    emit(j, i_b(1));                        /* b (patched: a TCG TB) */
-    j->tb->ishjit_jmp2_reset[which] = ij_offset(j);
-    emit_exit_tb(j, which);
+    {
+        /* (the unchained way: cold) */
+        uint32_t *c;
+
+        ij_to_cold(j);
+        c = j->ptr;
+        emit_pcsync(j, dest);
+        j->jmp2_c[which] = j->ptr;
+        emit(j, i_b(1));                    /* b (patched: a TCG TB) */
+        j->jmp2r_c[which] = j->ptr;
+        emit_exit_tb(j, which);
+        ij_to_hot(j);
+        emit_b_cold(j, c);
+    }
 }
 
 
@@ -941,7 +1010,7 @@ static void emit_lookup(IJ *j)
         /* the shared routine R_LOOKUP, x27 = this TB (its flags) */
         emit_checkenv(j, 3);
         emit_vstore(j, j->vwritten);
-        emit(j, i_adr(H_TMP2, (uint8_t *)j->tb - (uint8_t *)j->ptr));
+        emit_tb_addr(j, H_TMP2, 0);
         emit_jump_routine(j, ISHJIT_R_LOOKUP, H_TMP1);
     } else {
         emit_lookup_body(j, false);
@@ -1178,7 +1247,12 @@ static bool decode_mem(uint32_t insn, MemInfo *m, bool fp_ok)
     if (decode_atomic(insn, m)) {
         return true;
     }
-    if (m->rn == 31 && getenv("ISHJIT_NOSP") &&
+    static int nosp = -1;
+
+    if (nosp < 0) {
+        nosp = getenv("ISHJIT_NOSP") != NULL;
+    }
+    if (m->rn == 31 && nosp &&
         (insn & 0x3B000000) != 0x18000000) {
         return false;
     }
@@ -1994,8 +2068,15 @@ static void emit_tlb_access(IJ *j, const MemInfo *m, IJSlow *sl, int accsize)
             H_TMP1 << 5 | H_TMP1);                          /* eor x17, x17, x16, lsr #pb */
     sl->cbnz = j->ptr;
     emit(j, 0);                                             /* cbnz x17, slow */
-    if (getenv("ISHJIT_ALLSLOW")) {
-        sl->allslow = true;
+    {
+        static int allslow = -1;
+
+        if (allslow < 0) {
+            allslow = getenv("ISHJIT_ALLSLOW") != NULL;
+        }
+        if (allslow) {
+            sl->allslow = true;
+        }
     }
     emit(j, 0x8B000000 | H_TMP0 << 16 | H_TMP2 << 5 | H_TMP2);  /* add x27, x27, x16 */
 
@@ -2111,7 +2192,6 @@ static void emit_group_cold(IJ *j, IJSlow *sl)
     int accsize = (1 << m->size) * (m->pair ? 2 : 1);
 
     (void)accsize;
-    *sl->gbr |= ((j->ptr - sl->gbr) & 0x7ffff) << 5;
     if (sl->gkind == 1) {
         emit(j, i_str_x(31, H_ENV, offsetof(CPUARMState, ishjit_gslot[sl->gslot])));  /* (xzr) */
     }
@@ -2279,27 +2359,26 @@ static void emit_slow_desc(IJ *j, const IJSlow *sl, uint32_t *save, uint32_t *re
             (m->sign ? IJD_SIGN : 0) | (m->dest32 ? IJD_DEST32 : 0) |
             (m->vec ? IJD_VEC : 0) | m->akind << 8 | m->rt << 11 | m->rt2 << 16 |
             m->midx << 21 | (j->tbid & 3) << 25 | (m->mode == M_LIT ? IJD_LIT : 0));
-    emit(j, (uint32_t)((sl->resume - d) * 4));
+    ij_fixup(FX_C2H_REL, j->ptr, sl->resume, d);
+    emit(j, 0);                                     /* (resume - desc) */
     emit(j, j->vused ? (uint32_t)((restore - d) * 4) : 0);
     if (atomic) {
         emit(j, sl->insn);
     }
 }
 
-static void emit_slow(IJ *j, const IJSlow *sl, uint32_t *save, uint32_t *restore)
+/* (cold) the stub; *after_sub: where the alignment check's miss enters */
+static void emit_slow(IJ *j, const IJSlow *sl, uint32_t *save, uint32_t *restore,
+                      uint32_t **after_sub)
 {
     const MemInfo *m = &sl->m;
     int accsize = (1 << m->size) * (m->pair ? 2 : 1);
 
-    *sl->cbnz = sl->allslow ? i_b(j->ptr - sl->cbnz) :
-                0xB5000000 | ((j->ptr - sl->cbnz) & 0x7ffff) << 5 | H_TMP1;
     if (accsize > 1) {
         emit_addi(j, H_TMP0, H_TMP0, -(accsize - 1));
     }
     /* (the alignment check comes here, x16 already the first byte) */
-    if (sl->cbnz2) {
-        *sl->cbnz2 = 0xB5000000 | ((j->ptr - sl->cbnz2) & 0x7ffff) << 5 | H_TMP1;
-    }
+    *after_sub = j->ptr;
     emit_slow_desc(j, sl, save, restore);
 }
 
@@ -2556,6 +2635,8 @@ static int ishjit_gen(CPUState *cs, TranslationBlock *tb, vaddr pc,
         ij_insn_data = g_new0(uint64_t, TCG_MAX_INSNS * TARGET_INSN_START_WORDS);
     }
     ij_nreg = 0;
+    ij_nfix = 0;
+    j->cptr = ij_cold_buf;
     data = ij_insn_data;
     tcg_ctx->gen_insn_data = data;
 
@@ -2681,7 +2762,11 @@ static int ishjit_gen(CPUState *cs, TranslationBlock *tb, vaddr pc,
             break;                              /* a branch ends the block */
         }
     }
-    if (getenv("ISHJIT_STATS")) {
+    static int stats = -1;
+    if (stats < 0) {
+        stats = getenv("ISHJIT_STATS") != NULL;
+    }
+    if (stats) {
         ishjit_stat(n, n < max_insns && pc + 4 * n < page_end && (n == 0 || kinds[n - 1] < K_B) ?
                     ldl_le_p((uint8_t *)host_pc + 4 * n) : 0, n == 0);
     }
@@ -3123,7 +3208,10 @@ static int ishjit_gen(CPUState *cs, TranslationBlock *tb, vaddr pc,
             emit_jump(j, 0, j->pc_first + 4 * n);
         }
 
-        /* Slow paths: the block's save/restore helpers, then one stub each */
+        /*
+         * Slow paths: the block's save/restore helpers, then one stub each
+         * (cold), and a jump there for each at the hot code's end
+         */
         slow0 = ij_offset(j);
         if (j->nslow) {
             uint32_t *save[2] = { NULL, NULL }, *restore[2] = { NULL, NULL };
@@ -3135,42 +3223,78 @@ static int ishjit_gen(CPUState *cs, TranslationBlock *tb, vaddr pc,
                     need |= slows[k].flags == f;
                 }
                 if (need) {
-                    if ((uint8_t *)j->ptr + 1024 > j->highwater) {
-                        return -1;
-                    }
+                    ij_to_cold(j);
                     save[f] = j->ptr;
                     emit_save_thunk(j, f);
                     restore[f] = j->ptr;
                     emit_restore_thunk(j, f);
+                    ij_to_hot(j);
                 }
             }
             for (int k = 0; k < j->nslow; k++) {
+                IJSlow *sl = &slows[k];
+                uint32_t *c, *after_sub = NULL, *t;
+
                 if ((uint8_t *)j->ptr + 1024 > j->highwater) {
                     return -1;
                 }
-                if (slows[k].gkind) {
-                    emit_group_cold(j, &slows[k]);
-                    emit_slow_desc(j, &slows[k], save[slows[k].flags],
-                                   restore[slows[k].flags]);
+                if (j->cptr - ij_cold_buf > IJ_COLD_MAX - 256) {
+                    return -2;
+                }
+                ij_to_cold(j);
+                c = j->ptr;
+                if (sl->gkind) {
+                    emit_group_cold(j, sl);
+                    emit_slow_desc(j, sl, save[sl->flags], restore[sl->flags]);
                 } else {
-                    emit_slow(j, &slows[k], save[slows[k].flags],
-                              restore[slows[k].flags]);
+                    emit_slow(j, sl, save[sl->flags], restore[sl->flags], &after_sub);
+                }
+                ij_to_hot(j);
+                t = j->ptr;
+                emit_b_cold(j, c);
+                if (sl->gkind) {
+                    *sl->gbr |= ((t - sl->gbr) & 0x7ffff) << 5;
+                } else {
+                    *sl->cbnz = sl->allslow ? i_b(t - sl->cbnz) :
+                                0xB5000000 | ((t - sl->cbnz) & 0x7ffff) << 5 | H_TMP1;
+                    if (sl->cbnz2) {
+                        t = j->ptr;
+                        emit_b_cold(j, after_sub);
+                        *sl->cbnz2 = 0xB5000000 | ((t - sl->cbnz2) & 0x7ffff) << 5 | H_TMP1;
+                    }
                 }
             }
         }
 
-        /* The pending-exit check's target: nothing is live yet */
+        /* The pending-exit check's target (cold): nothing is live yet */
+        ij_to_cold(j);
         {
-            ptrdiff_t d = j->ptr - tbnz;
+            uint32_t *c = j->ptr;
 
-            *tbnz = i_b(d);
             emit_pcsync(j, j->pc_first);
             emit_exit_tb(j, TB_EXIT_REQUESTED);
+            ij_to_hot(j);
+            *tbnz = 0;
+            j->hot_save = j->ptr;
+            j->ptr = tbnz;
+            emit_b_cold(j, c);
+            j->ptr = j->hot_save;
+            ij_to_cold(j);
         }
         /* The full entry's part, then the jumps to R_PCSYNC and the exit */
-        *full_b = i_b(j->ptr - full_b);
+        {
+            uint32_t *c = j->ptr;
+
+            ij_to_hot(j);
+            j->hot_save = j->ptr;
+            j->ptr = full_b;
+            emit_b_cold(j, c);
+            j->ptr = j->hot_save;
+            ij_to_cold(j);
+        }
         emit_block_entry(j);
-        emit(j, i_b((uint32_t *)((uint8_t *)j->start + tb->ishjit_fast) - j->ptr));
+        ij_fixup(FX_C2H, j->ptr, (uint32_t *)((uint8_t *)j->start + tb->ishjit_fast), NULL);
+        emit(j, 0);                             /* b (fast entry) */
         if (j->npcsync) {
             for (int k = 0; k < j->npcsync; k++) {
                 *j->pend_pcsync[k] = i_b(j->ptr - j->pend_pcsync[k]);
@@ -3183,6 +3307,7 @@ static int ishjit_gen(CPUState *cs, TranslationBlock *tb, vaddr pc,
             }
             emit_jump_routine(j, ISHJIT_R_EXITTB, H_TMP0);
         }
+        ij_to_hot(j);
     }
 
     if (ij_offset(j) > 60000) {
@@ -3200,6 +3325,50 @@ static int ishjit_gen(CPUState *cs, TranslationBlock *tb, vaddr pc,
         }
         fputc('\n', f);
         funlockfile(f);
+    }
+    /*
+     * The cold code below the TB's struct (the top of what the region has
+     * left), the branches between hot and cold code fixed up
+     */
+    {
+        size_t cbytes = (j->cptr - ij_cold_buf) * 4;
+        uint8_t *cold = (uint8_t *)ROUND_DOWN((uintptr_t)tcg_ctx->code_gen_tbtop - cbytes, 16);
+#define COLD(p) ((uint32_t *)(cold + ((uint8_t *)(p) - (uint8_t *)ij_cold_buf)))
+
+        g_assert(!j->in_cold);
+        if (j->cptr - ij_cold_buf > IJ_COLD_MAX) {
+            tb->ishjit_fast = 0;
+            return -2;
+        }
+        if ((uint8_t *)j->ptr + 1024 + n * 16 + IJ_HIGHWATER > cold) {
+            return -1;                          /* (the region is full) */
+        }
+        memcpy(cold, ij_cold_buf, cbytes);
+        for (int k = 0; k < ij_nfix; k++) {
+            IJFix *f = &ij_fix[k];
+
+            switch (f->kind) {
+            case FX_H2C:
+                *f->at = i_b(COLD(f->to) - f->at);
+                break;
+            case FX_C2H:
+                *COLD(f->at) = i_b(f->to - COLD(f->at));
+                break;
+            case FX_C2H_REL:
+                *COLD(f->at) = (uint32_t)((uint8_t *)f->to - (uint8_t *)COLD(f->base));
+                break;
+            }
+        }
+        for (int w = 0; w < 2; w++) {
+            if (j->jmp2_c[w]) {
+                tb->ishjit_jmp2[w] = (uint8_t *)COLD(j->jmp2_c[w]) - (uint8_t *)j->start;
+                tb->ishjit_jmp2_reset[w] = (uint8_t *)COLD(j->jmp2r_c[w]) - (uint8_t *)j->start;
+            }
+        }
+#undef COLD
+        tcg_ctx->code_gen_tbtop = cold;
+        tcg_ctx->code_gen_highwater = cold - IJ_HIGHWATER;
+        flush_idcache_range((uintptr_t)tcg_splitwx_to_rx(cold), (uintptr_t)cold, cbytes);
     }
     tb->size = 4 * n;
     tb->icount = n;

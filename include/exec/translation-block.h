@@ -134,8 +134,8 @@ struct TranslationBlock {
      * registers are stored, and its unchained target.
      */
     uint16_t ishjit_fast;
-    uint16_t ishjit_jmp2[2];
-    uint16_t ishjit_jmp2_reset[2];
+    int32_t ishjit_jmp2[2];         /* (cold code: after the TB, far) */
+    int32_t ishjit_jmp2_reset[2];
 
     /*
      * Each TB has a NULL-terminated list (jmp_list_head) of incoming jumps.

@@ -355,6 +355,7 @@ static void tcg_region_assign(TCGContext *s, size_t curr_region)
     s->code_gen_ptr = start;
     s->code_gen_buffer_size = end - start;
     s->code_gen_highwater = end - TCG_HIGHWATER;
+    s->code_gen_tbtop = end;
 }
 
 static bool tcg_region_alloc__locked(TCGContext *s)

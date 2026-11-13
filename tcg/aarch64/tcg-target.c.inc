@@ -2145,9 +2145,6 @@ static void tcg_out_goto_tb(TCGContext *s, int which)
      * by tb_target_set_jmp_target.  Assert indirect load offset
      * in range early, regardless of direct branch distance.
      */
-    intptr_t i_off = tcg_pcrel_diff(s, (void *)get_jmp_target_addr(s, which));
-    tcg_debug_assert(i_off == sextract64(i_off, 0, 21));
-
     set_jmp_insn_offset(s, which);
     tcg_out32(s, I3206_B);
     tcg_out_insn(s, 3207, BR, TCG_REG_TMP0);
@@ -2166,11 +2163,15 @@ void tb_target_set_jmp_target(const TranslationBlock *tb, int n,
     if (d_offset == sextract64(d_offset, 0, 28)) {
         insn = deposit32(I3206_B, 0, 26, d_offset >> 2);
     } else {
-        uintptr_t i_addr = (uintptr_t)&tb->jmp_target_addr[n];
+        uintptr_t i_addr = (uintptr_t)tcg_splitwx_to_rx((void *)&tb->jmp_target_addr[n]);
         ptrdiff_t i_offset = i_addr - jmp_rx;
 
-        /* Note that we asserted this in range in tcg_out_goto_tb. */
-        insn = deposit32(I3305_LDR | TCG_REG_TMP0, 5, 19, i_offset >> 2);
+        if (i_offset == sextract64(i_offset, 0, 21)) {
+            insn = deposit32(I3305_LDR | TCG_REG_TMP0, 5, 19, i_offset >> 2);
+        } else {
+            /* iSH+: (TB structs apart from code) unchained: the reset path */
+            insn = deposit32(I3206_B, 0, 26, 2);
+        }
     }
     qatomic_set((uint32_t *)jmp_rw, insn);
     flush_idcache_range(jmp_rx, jmp_rw, 4);

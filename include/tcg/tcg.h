@@ -388,6 +388,7 @@ struct TCGContext {
 
     /* Threshold to flush the translated code buffer.  */
     void *code_gen_highwater;
+    void *code_gen_tbtop;     /* iSH+: TB structs grow down from here (RW) */
 
     /* Track which vCPU triggers events */
     CPUState *cpu;                      /* *_trans */

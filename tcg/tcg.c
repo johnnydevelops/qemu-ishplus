@@ -1576,23 +1576,32 @@ void tcg_init(size_t tb_size, int splitwx, unsigned max_cpus)
  * Allocate TBs right before their corresponding translated code, making
  * sure that TBs and code are on different cache lines.
  */
+/*
+ * iSH+: TB structs are taken from the top of the region, growing down,
+ * apart from the code (which grows up from the bottom): generated code then
+ * runs from densely packed lines and pages, with no TB struct between
+ * consecutive TBs' code. A goto_tb whose target is beyond a direct branch
+ * stays unchained (tb_target_set_jmp_target), the TB struct's literal
+ * being out of reach.
+ */
 TranslationBlock *tcg_tb_alloc(TCGContext *s)
 {
-    uintptr_t align = qemu_icache_linesize;
     TranslationBlock *tb;
-    void *next;
+    void *code;
 
  retry:
-    tb = (void *)ROUND_UP((uintptr_t)s->code_gen_ptr, align);
-    next = (void *)ROUND_UP((uintptr_t)(tb + 1), align);
+    tb = (void *)ROUND_DOWN((uintptr_t)s->code_gen_tbtop - sizeof(*tb), 64);
+    code = (void *)ROUND_UP((uintptr_t)s->code_gen_ptr, 16);
 
-    if (unlikely(next > s->code_gen_highwater)) {
+    if (unlikely((void *)tb < code + 2 * TCG_HIGHWATER)) {
         if (tcg_region_alloc(s)) {
             return NULL;
         }
         goto retry;
     }
-    qatomic_set(&s->code_gen_ptr, next);
+    s->code_gen_tbtop = tb;
+    s->code_gen_highwater = (void *)tb - TCG_HIGHWATER;
+    qatomic_set(&s->code_gen_ptr, code);
     return tb;
 }
 

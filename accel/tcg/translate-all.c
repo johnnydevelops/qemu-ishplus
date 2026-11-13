@@ -638,10 +638,8 @@ TranslationBlock *tb_gen_code(CPUState *cpu,
 
     /* if the TB already exists, discard what we just translated */
     if (unlikely(existing_tb != tb)) {
-        uintptr_t orig_aligned = (uintptr_t)gen_code_buf;
-
-        orig_aligned -= ROUND_UP(sizeof(*tb), qemu_icache_linesize);
-        qatomic_set(&tcg_ctx->code_gen_ptr, (void *)orig_aligned);
+        /* (iSH+: the TB struct is apart, at the region's top) */
+        qatomic_set(&tcg_ctx->code_gen_ptr, (void *)gen_code_buf);
         tcg_tb_remove(tb);
         return existing_tb;
     }
