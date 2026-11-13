@@ -1128,6 +1128,10 @@ struct ArchCPU {
     bool prop_lpa2;
     /* iSH+: "bti": FEAT_BTI on -cpu max (off: BTYPE is no part of TB flags) */
     bool prop_bti;
+    /* iSH+: "a13": only the instructions of the Apple A13 (ARMv8.4) */
+    bool prop_a13;
+    /* iSH+: "ishjit": TBs translated by copying guest instructions (needs a13) */
+    bool prop_ishjit;
 
     /* DCZ blocksize, in log_2(words), ie low 4 bits of DCZID_EL0 */
     uint8_t dcz_blocksize;

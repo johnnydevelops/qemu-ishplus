@@ -957,6 +957,12 @@ static const TCGConstraintSet constraint_sets[] = {
 
 #include "tcg-target.c.inc"
 
+/* iSH+ ishjit: the epilogue's TB-exit entry, for TBs it generates */
+const void *tcg_ishjit_tb_ret_addr(void)
+{
+    return tb_ret_addr;
+}
+
 #if !defined(CONFIG_TCG_INTERPRETER) && !defined(CONFIG_TCG_THREADED_INTERPRETER)
 /* Validate CPUTLBDescFast placement. */
 QEMU_BUILD_BUG_ON((int)(offsetof(CPUNegativeOffsetState, tlb.f[0]) -

@@ -47,6 +47,7 @@
 #include "exec/cputlb.h"
 #include "exec/page-protection.h"
 #include "tb-internal.h"
+#include "accel/tcg/ishjit.h"
 #include "exec/translator.h"
 #include "exec/tb-flush.h"
 #include "qemu/bitmap.h"
@@ -288,6 +289,9 @@ static int setjmp_gen_code(CPUArchState *env, TranslationBlock *tb,
 }
 
 /* Called with mmap_lock held for user mode emulation.  */
+int (*ishjit_gen_code_hook)(CPUState *cs, TranslationBlock *tb, vaddr pc,
+                            void *host_pc, int max_insns, void *buf);
+
 TranslationBlock *tb_gen_code(CPUState *cpu,
                               vaddr pc, uint64_t cs_base,
                               uint32_t flags, int cflags)
@@ -359,7 +363,18 @@ TranslationBlock *tb_gen_code(CPUState *cpu,
  restart_translate:
     trace_translate_block(tb, pc, tb->tc.ptr);
 
-    gen_code_size = setjmp_gen_code(env, tb, pc, host_pc, &max_insns, &ti);
+    /* iSH+: the target's own translator first (ishjit), or TCG */
+    gen_code_size = ISHJIT_DECLINE;
+    if (ishjit_gen_code_hook) {
+        gen_code_size = ishjit_gen_code_hook(cpu, tb, pc, host_pc, max_insns,
+                                             gen_code_buf);
+        if (gen_code_size >= 0) {
+            max_insns = tb->icount;
+        }
+    }
+    if (gen_code_size == ISHJIT_DECLINE) {
+        gen_code_size = setjmp_gen_code(env, tb, pc, host_pc, &max_insns, &ti);
+    }
     if (unlikely(gen_code_size < 0)) {
         switch (gen_code_size) {
         case -1:

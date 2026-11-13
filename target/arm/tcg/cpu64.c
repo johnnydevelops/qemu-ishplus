@@ -208,6 +208,16 @@ static const Property arm_cpu_lpa2_property =
  */
 static const Property arm_cpu_bti_property =
     DEFINE_PROP_BOOL("bti", ARMCPU, prop_bti, true);
+/*
+ * iSH+: a13=on limits the instructions -cpu max offers to those of the Apple
+ * A13 (ARMv8.4, the iPad iSH+ targets), so that a translator copying guest
+ * instructions to the host (ishjit) runs the guest's code as it is. System
+ * features (emulated by QEMU, whatever the host) are left as they are.
+ */
+static const Property arm_cpu_a13_property =
+    DEFINE_PROP_BOOL("a13", ARMCPU, prop_a13, false);
+static const Property arm_cpu_ishjit_property =
+    DEFINE_PROP_BOOL("ishjit", ARMCPU, prop_ishjit, false);
 
 static void aarch64_a55_initfn(Object *obj)
 {
@@ -1306,6 +1316,8 @@ void aarch64_max_tcg_initfn(Object *obj)
                         cpu_max_set_l0gptsz, NULL, NULL);
     qdev_property_add_static(DEVICE(obj), &arm_cpu_lpa2_property);
     qdev_property_add_static(DEVICE(obj), &arm_cpu_bti_property);
+    qdev_property_add_static(DEVICE(obj), &arm_cpu_a13_property);
+    qdev_property_add_static(DEVICE(obj), &arm_cpu_ishjit_property);
 }
 
 static const ARMCPUInfo aarch64_cpus[] = {

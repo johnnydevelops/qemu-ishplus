@@ -48,6 +48,7 @@ arm_ss.add(when: 'TARGET_AARCH64', if_true: files(
   'cpu64.c',
   'gengvec64.c',
   'translate-a64.c',
+  'ishjit.c',
   'translate-sve.c',
   'translate-sme.c',
   'helper-a64.c',

@@ -32,6 +32,7 @@
 #include "accel/tcg/cpu-ops.h"
 #endif /* CONFIG_TCG */
 #include "internals.h"
+#include "accel/tcg/ishjit.h"
 #include "cpu-features.h"
 #include "exec/exec-all.h"
 #include "hw/qdev-properties.h"
@@ -1927,6 +1928,79 @@ static void arm_cpu_finalizefn(Object *obj)
 #endif
 }
 
+/* iSH+: each ID field at most the A13's value (lower ones stay) */
+#define ISHPLUS_CAP(reg, R, F, v) \
+    (reg) = FIELD_DP64((reg), R, F, MIN(FIELD_EX64((reg), R, F), (v)))
+
+static void ishplus_cap_a13(ARMCPU *cpu)
+{
+    uint64_t t;
+
+    t = cpu->isar.id_aa64isar0;
+    ISHPLUS_CAP(t, ID_AA64ISAR0, AES, 2);
+    ISHPLUS_CAP(t, ID_AA64ISAR0, SHA1, 1);
+    ISHPLUS_CAP(t, ID_AA64ISAR0, SHA2, 2);
+    ISHPLUS_CAP(t, ID_AA64ISAR0, CRC32, 1);
+    ISHPLUS_CAP(t, ID_AA64ISAR0, ATOMIC, 2);
+    ISHPLUS_CAP(t, ID_AA64ISAR0, TME, 0);
+    ISHPLUS_CAP(t, ID_AA64ISAR0, RDM, 1);
+    ISHPLUS_CAP(t, ID_AA64ISAR0, SHA3, 1);
+    ISHPLUS_CAP(t, ID_AA64ISAR0, SM3, 0);
+    ISHPLUS_CAP(t, ID_AA64ISAR0, SM4, 0);
+    ISHPLUS_CAP(t, ID_AA64ISAR0, DP, 1);
+    ISHPLUS_CAP(t, ID_AA64ISAR0, FHM, 1);
+    ISHPLUS_CAP(t, ID_AA64ISAR0, TS, 1);          /* FlagM, not FlagM2 */
+    ISHPLUS_CAP(t, ID_AA64ISAR0, RNDR, 0);
+    cpu->isar.id_aa64isar0 = t;
+
+    t = cpu->isar.id_aa64isar1;
+    ISHPLUS_CAP(t, ID_AA64ISAR1, DPB, 1);
+    ISHPLUS_CAP(t, ID_AA64ISAR1, APA, 0);
+    ISHPLUS_CAP(t, ID_AA64ISAR1, API, 0);
+    ISHPLUS_CAP(t, ID_AA64ISAR1, JSCVT, 1);
+    ISHPLUS_CAP(t, ID_AA64ISAR1, FCMA, 1);
+    ISHPLUS_CAP(t, ID_AA64ISAR1, LRCPC, 2);
+    ISHPLUS_CAP(t, ID_AA64ISAR1, GPA, 0);
+    ISHPLUS_CAP(t, ID_AA64ISAR1, GPI, 0);
+    ISHPLUS_CAP(t, ID_AA64ISAR1, FRINTTS, 0);
+    ISHPLUS_CAP(t, ID_AA64ISAR1, SB, 0);
+    ISHPLUS_CAP(t, ID_AA64ISAR1, SPECRES, 0);
+    ISHPLUS_CAP(t, ID_AA64ISAR1, BF16, 0);
+    ISHPLUS_CAP(t, ID_AA64ISAR1, DGH, 0);
+    ISHPLUS_CAP(t, ID_AA64ISAR1, I8MM, 0);
+    ISHPLUS_CAP(t, ID_AA64ISAR1, LS64, 0);
+    cpu->isar.id_aa64isar1 = t;
+
+    cpu->isar.id_aa64isar2 = 0;     /* MOPS, WFxT, CSSC... all v8.7 and later */
+
+    t = cpu->isar.id_aa64pfr0;
+    ISHPLUS_CAP(t, ID_AA64PFR0, FP, 1);
+    ISHPLUS_CAP(t, ID_AA64PFR0, ADVSIMD, 1);
+    ISHPLUS_CAP(t, ID_AA64PFR0, SVE, 0);
+    ISHPLUS_CAP(t, ID_AA64PFR0, DIT, 1);
+    cpu->isar.id_aa64pfr0 = t;
+
+    t = cpu->isar.id_aa64pfr1;
+    ISHPLUS_CAP(t, ID_AA64PFR1, BT, 0);
+    ISHPLUS_CAP(t, ID_AA64PFR1, SSBS, 0);
+    ISHPLUS_CAP(t, ID_AA64PFR1, MTE, 0);
+    ISHPLUS_CAP(t, ID_AA64PFR1, SME, 0);
+    ISHPLUS_CAP(t, ID_AA64PFR1, RNDR_TRAP, 0);
+    ISHPLUS_CAP(t, ID_AA64PFR1, NMI, 0);
+    ISHPLUS_CAP(t, ID_AA64PFR1, GCS, 0);
+    ISHPLUS_CAP(t, ID_AA64PFR1, THE, 0);
+    ISHPLUS_CAP(t, ID_AA64PFR1, MTEX, 0);
+    cpu->isar.id_aa64pfr1 = t;
+
+    cpu->isar.id_aa64zfr0 = 0;
+    cpu->isar.id_aa64smfr0 = 0;
+
+    /* FEAT_AFP changes what FPCR's bits do to FP instructions */
+    t = cpu->isar.id_aa64mmfr1;
+    ISHPLUS_CAP(t, ID_AA64MMFR1, AFP, 0);
+    cpu->isar.id_aa64mmfr1 = t;
+}
+
 void arm_cpu_finalize_features(ARMCPU *cpu, Error **errp)
 {
     Error *local_err = NULL;
@@ -1972,6 +2046,20 @@ void arm_cpu_finalize_features(ARMCPU *cpu, Error **errp)
             cpu->isar.id_aa64pfr1 = FIELD_DP64(cpu->isar.id_aa64pfr1,
                                                ID_AA64PFR1, BT, 0);
         }
+        /* iSH+: a13=on (-cpu max only): at most the A13's instructions */
+        if (object_property_find(OBJECT(cpu), "a13") && cpu->prop_a13) {
+            ishplus_cap_a13(cpu);
+        }
+#ifdef TARGET_AARCH64
+        /* iSH+: ishjit=on copies guest instructions to the host: A13 ones */
+        if (object_property_find(OBJECT(cpu), "ishjit") && cpu->prop_ishjit) {
+            if (!cpu->prop_a13) {
+                error_setg(errp, "ishjit=on needs a13=on");
+                return;
+            }
+            ishjit_enable();
+        }
+#endif
     }
 #endif
 
