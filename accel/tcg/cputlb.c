@@ -105,13 +105,15 @@ static inline uint64_t tlb_read_idx(const CPUTLBEntry *entry,
 {
     /* Do not rearrange the CPUTLBEntry structure members. */
     QEMU_BUILD_BUG_ON(offsetof(CPUTLBEntry, addr_read) !=
-                      MMU_DATA_LOAD * sizeof(uintptr_t));
+                      TLB_ENTRY_IDX(MMU_DATA_LOAD) * sizeof(uintptr_t));
     QEMU_BUILD_BUG_ON(offsetof(CPUTLBEntry, addr_write) !=
-                      MMU_DATA_STORE * sizeof(uintptr_t));
+                      TLB_ENTRY_IDX(MMU_DATA_STORE) * sizeof(uintptr_t));
     QEMU_BUILD_BUG_ON(offsetof(CPUTLBEntry, addr_code) !=
-                      MMU_INST_FETCH * sizeof(uintptr_t));
+                      TLB_ENTRY_IDX(MMU_INST_FETCH) * sizeof(uintptr_t));
+    QEMU_BUILD_BUG_ON(offsetof(CPUTLBEntry, addend) != offsetof(CPUTLBEntry, addr_read) + 8 ||
+                      offsetof(CPUTLBEntry, addr_write) != offsetof(CPUTLBEntry, addend) + 8);
 
-    const uintptr_t *ptr = &entry->addr_idx[access_type];
+    const uintptr_t *ptr = &entry->addr_idx[TLB_ENTRY_IDX(access_type)];
     /* ofs might correspond to .addr_write, so use qatomic_read */
     return qatomic_read(ptr);
 }
@@ -1281,7 +1283,7 @@ static inline void tlb_set_compare(CPUTLBEntryFull *full, CPUTLBEntry *ent,
         address = -1;
         flags = 0;
     }
-    ent->addr_idx[access_type] = address;
+    ent->addr_idx[TLB_ENTRY_IDX(access_type)] = address;
     full->slow_flags[access_type] = flags;
 }
 

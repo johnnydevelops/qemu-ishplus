@@ -23,15 +23,20 @@
 
 /* Minimalized TLB entry for use by TCG fast path. */
 typedef union CPUTLBEntry {
+    /*
+     * iSH+: the addend right after addr_read and right before addr_write,
+     * so that a load's or a store's check reads its comparator and the
+     * addend with one ldp (TLB_ENTRY_IDX maps an access type to its slot).
+     */
     struct {
         uintptr_t addr_read;
-        uintptr_t addr_write;
-        uintptr_t addr_code;
         /*
          * Addend to virtual address to get host address.  IO accesses
          * use the corresponding iotlb value.
          */
         uintptr_t addend;
+        uintptr_t addr_write;
+        uintptr_t addr_code;
     };
     /*
      * Padding to get a power of two size, as well as index
@@ -41,6 +46,9 @@ typedef union CPUTLBEntry {
 } CPUTLBEntry;
 
 QEMU_BUILD_BUG_ON(sizeof(CPUTLBEntry) != (1 << CPU_TLB_ENTRY_BITS));
+
+/* the addr_idx[] slot of an access type's comparator (load 0, store 2, code 3) */
+#define TLB_ENTRY_IDX(access_type) ((access_type) + ((access_type) != 0))
 
 /*
  * Data elements that are per MMU mode, accessed by the fast path.

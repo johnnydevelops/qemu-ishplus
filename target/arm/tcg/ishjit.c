@@ -2030,6 +2030,20 @@ static void emit_access(IJ *j, const MemInfo *m, int accsize)
     }
 }
 
+/* x17 = the entry's (x27) comparator at @cmp_off, x27 = its addend: one ldp */
+static void emit_tlb_ldp(IJ *j, int cmp_off)
+{
+    QEMU_BUILD_BUG_ON(offsetof(CPUTLBEntry, addend) != offsetof(CPUTLBEntry, addr_read) + 8 ||
+                      offsetof(CPUTLBEntry, addr_write) != offsetof(CPUTLBEntry, addend) + 8);
+    if (cmp_off == offsetof(CPUTLBEntry, addr_read)) {
+        emit(j, 0xA9400000 | (cmp_off / 8) << 15 | H_TMP2 << 10 | H_TMP2 << 5 | H_TMP1);
+    } else {
+        g_assert(cmp_off == offsetof(CPUTLBEntry, addr_write));
+        emit(j, 0xA9400000 | ((int)offsetof(CPUTLBEntry, addend) / 8) << 15 |
+                H_TMP1 << 10 | H_TMP2 << 5 | H_TMP2);
+    }
+}
+
 /* The inline TLB check of x16 (its miss: sl's slow path), then the access */
 static void emit_tlb_access(IJ *j, const MemInfo *m, IJSlow *sl, int accsize)
 {
@@ -2061,8 +2075,7 @@ static void emit_tlb_access(IJ *j, const MemInfo *m, IJSlow *sl, int accsize)
     if (accsize > 1) {
         emit_addi(j, H_TMP0, H_TMP0, accsize - 1);
     }
-    emit(j, i_ldr_x(H_TMP1, H_TMP2, cmp_off));
-    emit(j, i_ldr_x(H_TMP2, H_TMP2, offsetof(CPUTLBEntry, addend)));
+    emit_tlb_ldp(j, cmp_off);
     emit(j, 0x93C00000 | H_TMP1 << 16 | pb << 10 | H_TMP1 << 5 | H_TMP1);  /* ror x17, x17, #pb */
     emit(j, 0xCA000000 | 1 << 22 | H_TMP0 << 16 | pb << 10 |
             H_TMP1 << 5 | H_TMP1);                          /* eor x17, x17, x16, lsr #pb */
@@ -2234,8 +2247,7 @@ static void emit_mem_(IJ *j, const MemInfo *m, vaddr ipc, IJSlow *sl)
                 H_TMP1 << 5 | H_TMP1);                      /* and x17, x17, x16, lsr #.. */
         emit(j, 0x8B000000 | H_TMP1 << 16 | H_TMP2 << 5 | H_TMP2);  /* add x27, x27, x17 */
         emit_addi(j, H_TMP0, H_TMP0, j->g_span - 1);
-        emit(j, i_ldr_x(H_TMP1, H_TMP2, cmp_off));
-        emit(j, i_ldr_x(H_TMP2, H_TMP2, offsetof(CPUTLBEntry, addend)));
+        emit_tlb_ldp(j, cmp_off);
         emit(j, 0x93C00000 | H_TMP1 << 16 | pb << 10 | H_TMP1 << 5 | H_TMP1);  /* ror x17, x17, #pb */
         emit(j, 0xCA000000 | 1 << 22 | H_TMP0 << 16 | pb << 10 |
                 H_TMP1 << 5 | H_TMP1);                      /* eor x17, x17, x16, lsr #pb */
