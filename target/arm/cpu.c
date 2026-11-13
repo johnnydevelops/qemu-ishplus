@@ -2057,6 +2057,10 @@ void arm_cpu_finalize_features(ARMCPU *cpu, Error **errp)
                 error_setg(errp, "ishjit=on needs a13=on");
                 return;
             }
+            if (!tcg_ishjit_tb_ret_addr()) {
+                error_setg(errp, "ishjit=on needs native TCG (not the interpreter)");
+                return;
+            }
             ishjit_enable(&cpu->env);
         }
 #endif

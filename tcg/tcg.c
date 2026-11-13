@@ -961,7 +961,11 @@ static const TCGConstraintSet constraint_sets[] = {
 /* iSH+ ishjit: the epilogue's TB-exit entry, for TBs it generates */
 const void *tcg_ishjit_tb_ret_addr(void)
 {
+#ifdef CONFIG_TCG_INTERPRETER
+    return NULL;                /* (ishjit needs native code: not with TCI) */
+#else
     return tb_ret_addr;
+#endif
 }
 
 #if !defined(CONFIG_TCG_INTERPRETER) && !defined(CONFIG_TCG_THREADED_INTERPRETER)

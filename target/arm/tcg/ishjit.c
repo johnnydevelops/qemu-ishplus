@@ -2140,6 +2140,11 @@ void ishjit_take_exception(CPUARMState *env, uint32_t excp, uint32_t syn)
     env->exception.target_el = exception_target_el(env);
     bql_lock();
     cs->cc->tcg_ops->do_interrupt(cs);
+    /*
+     * do_interrupt asks cpu_exec not to chain from the last TB (the TB
+     * flags changed): the caller looks the next TB up afresh instead
+     */
+    cs->interrupt_request &= ~CPU_INTERRUPT_EXITTB;
     bql_unlock();
     cs->exception_index = -1;
 }
