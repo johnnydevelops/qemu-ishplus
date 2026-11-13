@@ -1931,6 +1931,7 @@ static void emit_slow(IJ *j, const IJSlow *sl, uint32_t *save, uint32_t *restore
     if (sl->cbnz2) {
         *sl->cbnz2 = 0xB5000000 | ((j->ptr - sl->cbnz2) & 0x7ffff) << 5 | H_TMP1;
     }
+
     if (m->akind == A_LSE || m->akind == A_CAS || m->akind == A_LDX ||
         m->akind == A_STX) {
         emit(j, i_adr(H_TMP2, 8));
@@ -2439,11 +2440,12 @@ static int ishjit_gen(CPUState *cs, TranslationBlock *tb, vaddr pc,
                 emit_pc_add(j, (int64_t)(ipc + (kinds[i] == K_SVC ? 4 : 0) - j->pc_first));
                 emit(j, i_mov_x(0, H_ENV));
                 if (kinds[i] == K_SVC) {
+                    /* taken here, then on at the vector (no cpu_exec trip) */
                     emit_movi(j, 1, EXCP_SWI);
                     emit_movi(j, 2, syn_aa64_svc(imm));
-                    emit_movi(j, H_TMP0, (uintptr_t)helper_exception_with_syndrome);
+                    emit_movi(j, H_TMP0, (uintptr_t)ishjit_take_exception);
                     emit(j, i_blr(H_TMP0));
-                    emit(j, 0xD4200000);            /* (noreturn) brk #0 */
+                    emit_continue_or_exit(j);
                 } else {
                     emit_movi(j, 1, syn_aa64_bkpt(imm));
                     emit_movi(j, H_TMP0, (uintptr_t)helper_exception_bkpt_insn);
