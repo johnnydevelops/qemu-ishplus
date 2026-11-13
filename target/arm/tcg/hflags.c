@@ -421,8 +421,9 @@ static CPUARMTBFlags rebuild_hflags_a64(CPUARMState *env, int el, int fp_el,
      * as the host's own instructions (FPCR writes end the TB and rebuild
      * these flags).
      */
+    /* (also FZ16 and AHP: ishjit copies half-precision instructions) */
     if (!(env->vfp.fpcr & (FPCR_RMODE_MASK | FPCR_FZ | FPCR_DN | FPCR_AH |
-                           FPCR_FIZ | FPCR_NEP))) {
+                           FPCR_FIZ | FPCR_NEP | FPCR_FZ16 | FPCR_AHP))) {
         DP_TBFLAG_A64(flags, FPDEFAULT, 1);
     }
     if (env->vfp.fpcr & FPCR_NEP) {
