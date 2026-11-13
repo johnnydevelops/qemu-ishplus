@@ -778,7 +778,7 @@ typedef struct CPUArchState {
     } ishplus_hf_cache[4][ISHPLUS_HF_WAYS];
 
     /* iSH+ ishjit: the shared routines' (RX) addresses (ishjit.c, ISHJIT_R_*) */
-    uint64_t ishjit_routine[4];
+    uint64_t ishjit_routine[8];
 
     /* Fields after this point are preserved across CPU reset. */
 
