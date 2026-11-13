@@ -1800,7 +1800,7 @@ DO_FMUL_IDX(gvec_fmls_nf_idx_s, float32_sub, float32_mul, float32, H4)
 #define NATIVE_FP_OK(S) arm_native_fp_ok(S)
 #define NATIVE_FMA_float32 native_fmas
 #define NATIVE_FMA_float64 native_fmad
-#define NATIVE_FMA_float16(A, B, C) (A) /* never: native_ok is false */
+#define NATIVE_FMA_float16(A, B, C) (A) /* never: native_ok is false for FP16 */
 #else
 #define NATIVE_FP_OK(S) false
 #define NATIVE_FMA_float32(A, B, C) (A)
@@ -1815,7 +1815,8 @@ void HELPER(NAME)(void *vd, void *vn, void *vm, void *va,                  \
     intptr_t segment = MIN(16, oprsz) / sizeof(TYPE);                      \
     intptr_t idx = simd_data(desc);                                        \
     TYPE *d = vd, *n = vn, *m = vm, *a = va;                               \
-    bool native_ok = NEGF == 0 && NATIVE_FP_OK(stat);                      \
+    bool native_ok = NEGF == 0 && sizeof(TYPE) >= 4 && /* (no FP16) */    \
+                     NATIVE_FP_OK(stat);                                   \
     for (i = 0; i < oprsz / sizeof(TYPE); i += segment) {                  \
         TYPE mm = m[H(i + idx)];                                           \
         if (native_ok) {                                                   \
