@@ -20,6 +20,8 @@
 #include "qemu/osdep.h"
 #include "qemu/log.h"
 #include "qemu/cacheflush.h"
+#include "qemu/main-loop.h"
+#include "accel/tcg/cpu-ops.h"
 #include "cpu.h"
 #include "hw/core/cpu.h"
 #include "internals.h"
@@ -29,6 +31,8 @@
 #include "accel/tcg/ishjit.h"
 #include "translate.h"
 #include "cpregs.h"
+#include "exec/address-spaces.h"
+
 #include "ishjit-simd.h"
 #include "accel/tcg/tb-jmp-cache.h"
 #include "accel/tcg/tb-hash.h"
@@ -116,6 +120,7 @@ typedef struct {
     bool fp_ok;                 /* FP/SIMD not trapped (FPEXC_EL 0) */
     bool fp_default;            /* FPCR all default: host FP is the guest's */
     bool fgt_active, fgt_svc, trap_eret;
+    bool unpriv;                /* TB flag UNPRIV: ldtr/sttr use the user index */
     bool el2_el3;               /* (the CPU has EL2 or EL3: more access checks) */
     uint64_t sysconst;          /* (classify_sys: an ARM_CP_CONST's value) */
     uint32_t cur_insn;          /* the guest insn being emitted */
@@ -215,6 +220,13 @@ static unsigned vreg_off(int v)
 {
     return offsetof(CPUARMState, vfp.zregs[v]);
 }
+
+static int tlb_fast_off(int mmu_idx)
+{
+    return (int)offsetof(ArchCPU, parent_obj.neg.tlb.f[mmu_idx]) -
+           (int)offsetof(ArchCPU, env);
+}
+
 
 /*
  * A64 logical immediates: N:immr:imms is reserved when no element size
@@ -485,12 +497,83 @@ static void emit_flags_to_env(IJ *j);
 enum { ISHJIT_R_LOAD, ISHJIT_R_SYNC, ISHJIT_R_SAVE, ISHJIT_R_SCRATCH };
 static uint64_t ishjit_routine_rx[3];
 
+/*
+ * debugging: ISHJIT_SITES=1 records where full stores (R_SYNC) are called
+ * from, and prints the top call sites at exit with the TB's guest end
+ */
+#define ISHJIT_SITES_N (1 << 20)
+static uint64_t ishjit_site_idx;
+static uint64_t *ishjit_sites;
+static int site_cmp(const void *a, const void *b)
+{
+    uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+    return x < y ? -1 : x > y;
+}
+static void ishjit_sites_dump(void)
+{
+    uint64_t n = MIN(ishjit_site_idx, ISHJIT_SITES_N);
+    uint64_t top_a[20] = {0}, top_c[20] = {0};
+
+    qsort(ishjit_sites, n, 8, site_cmp);
+    for (uint64_t i = 0; i < n;) {
+        uint64_t k = i;
+        while (k < n && ishjit_sites[k] == ishjit_sites[i]) {
+            k++;
+        }
+        for (int t = 0; t < 20; t++) {
+            if (k - i > top_c[t]) {
+                memmove(&top_c[t + 1], &top_c[t], (19 - t) * 8);
+                memmove(&top_a[t + 1], &top_a[t], (19 - t) * 8);
+                top_c[t] = k - i;
+                top_a[t] = ishjit_sites[i];
+                break;
+            }
+        }
+        i = k;
+    }
+    for (int t = 0; t < 20 && top_c[t]; t++) {
+        TranslationBlock *tb = tcg_tb_lookup(top_a[t]);
+        uint64_t paddr = tb ? tb_page_addr0(tb) : 0;
+        uint32_t next = 0;
+
+        if (tb && tb_page_addr0(tb) != -1) {
+            next = ldl_le_phys(&address_space_memory, 0x40000000 + paddr + tb->size);  /* (virt: RAM base) */
+        }
+        uint32_t lastw = tb && tb->size ?
+            ldl_le_phys(&address_space_memory, 0x40000000 + paddr + tb->size - 4) : 0;
+        fprintf(stderr, "ISHJIT site %3d%% n=%llu tb pa=%llx size=%u last %08x next %08x\n",
+                (int)(100 * top_c[t] / n), (unsigned long long)top_c[t],
+                (unsigned long long)paddr, tb ? tb->size : 0, lastw, next);
+    }
+}
+
+/* debugging: ISHJIT_COUNT=1 counts full loads and stores (printed at exit) */
+static uint64_t ishjit_count[2];
+static void ishjit_count_dump(void)
+{
+    fprintf(stderr, "ISHJIT full loads %llu, full stores %llu\n",
+            (unsigned long long)ishjit_count[0], (unsigned long long)ishjit_count[1]);
+}
+static void emit_count(IJ *j, int k)
+{
+    if (getenv("ISHJIT_COUNT")) {
+        emit_movi(j, H_TMP0, (uintptr_t)&ishjit_count[k]);
+        emit(j, i_ldr_x(H_TMP1, H_TMP0, 0));
+        emit(j, 0x91000400 | H_TMP1 << 5 | H_TMP1);             /* add x17, x17, #1 */
+        emit(j, i_str_x(H_TMP1, H_TMP0, 0));
+    }
+}
+
 static void *ishjit_emit_shared(void *code_ptr)
 {
     IJ jj = { .ptr = code_ptr, .start = code_ptr };
     IJ *j = &jj;
 
+    if (getenv("ISHJIT_COUNT")) {
+        atexit(ishjit_count_dump);
+    }
     ishjit_routine_rx[ISHJIT_R_LOAD] = (uintptr_t)tcg_splitwx_to_rx(j->ptr);
+    emit_count(j, 0);
     emit_flags_from_env(j);
     for (int g = 0; g < 32; g++) {
         if (g2h[g] != H_NONE) {
@@ -501,6 +584,22 @@ static void *ishjit_emit_shared(void *code_ptr)
 
     for (int r = ISHJIT_R_SYNC; r <= ISHJIT_R_SAVE; r++) {
         ishjit_routine_rx[r] = (uintptr_t)tcg_splitwx_to_rx(j->ptr);
+        if (r == ISHJIT_R_SYNC) {
+            emit_count(j, 1);
+            if (getenv("ISHJIT_SITES")) {
+                if (!ishjit_sites) {
+                    ishjit_sites = g_new0(uint64_t, ISHJIT_SITES_N);
+                    atexit(ishjit_sites_dump);
+                }
+                emit_movi(j, H_TMP0, (uintptr_t)&ishjit_site_idx);
+                emit(j, i_ldr_x(H_TMP1, H_TMP0, 0));
+                emit(j, 0x91000400 | H_TMP1 << 5 | H_TMP1);         /* add x17, x17, #1 */
+                emit(j, i_str_x(H_TMP1, H_TMP0, 0));
+                emit(j, 0x92404E31);                                /* and x17, x17, #0xfffff */
+                emit_movi(j, H_TMP0, (uintptr_t)ishjit_sites);
+                emit(j, 0xF8317A1B);                                /* str x27, [x16, x17, lsl #3] */
+            }
+        }
         for (int g = 0; g < 32; g++) {
             if (g2h[g] != H_NONE) {
                 emit(j, i_str_x(g2h[g], H_ENV, xreg_off(g)));
@@ -865,6 +964,8 @@ typedef struct {
     bool vec;               /* SIMD&FP register (size up to 4: Q) */
     uint8_t akind;          /* A_*: ordered, exclusive or atomic access */
     uint8_t rs;             /* (atomics, cas: Rs; stxr: the status) */
+    bool unpriv;            /* ldtr/sttr: through the user MMU index */
+    int8_t midx;            /* the core MMU index of the access */
     uint8_t rt, rt2, rn, rm;
     uint8_t mode, wb, option, shift;
     bool prefetch;
@@ -957,9 +1058,7 @@ static bool decode_mem(uint32_t insn, MemInfo *m, bool fp_ok)
         } else if ((insn & 0x3B200000) == 0x38000000) {
             unsigned kind = (insn >> 10) & 3;
 
-            if (kind == 2) {
-                return false;                       /* ldtr/sttr (unprivileged) */
-            }
+            m->unpriv = kind == 2;                  /* ldtr/sttr: no writeback */
             m->mode = M_IMM;
             m->imm = sextract32(insn, 12, 9);
             m->wb = kind == 1 ? WB_POST : kind == 3 ? WB_PRE : WB_NONE;
@@ -1211,9 +1310,8 @@ void ishjit_atomic_slow(CPUARMState *env, uint64_t addr, uint32_t insn,
 }
 
 enum { K_STOP, K_DP, K_NOP, K_ADR, K_MEM, K_FP, K_COPY, K_CLREX, K_MRS, K_MSR,
-       K_MRSCONST,
-       K_B, K_BL, K_BCOND, K_CB, K_TB, K_BREG, K_SVC, K_BRK, K_ERET, K_ISB,
-       K_DAIFSET, K_DAIFCLR };
+       K_MRSCONST, K_DAIFSET, K_DAIFCLR,
+       K_B, K_BL, K_BCOND, K_CB, K_TB, K_BREG, K_SVC, K_BRK, K_ERET, K_ISB };
 
 /* System instructions ishjit handles itself (others: TCG) */
 static int classify_sys(uint32_t insn, IJ *j, unsigned *off, bool *spcheck)
@@ -1405,6 +1503,31 @@ static void fp_regs(uint32_t insn, const SimdOperands *g, uint32_t *reads,
 static int classify(uint32_t insn, OperandInfo *o, MemInfo *m, bool mem_ok,
                     bool fp_ok, SimdOperands *g, IJ *j)
 {
+    if (mem_ok && decode_mem(insn, m, fp_ok)) {
+        m->midx = j->mmu_idx;
+        if (m->unpriv && j->unpriv) {
+            /* as TCG's get_a64_user_mem_index */
+            ARMMMUIdx cur = core_to_aa64_mmu_idx(j->mmu_idx), user = cur;
+
+            switch (cur) {
+            case ARMMMUIdx_E10_1:
+            case ARMMMUIdx_E10_1_PAN:
+                user = ARMMMUIdx_E10_0;
+                break;
+            case ARMMMUIdx_E20_2:
+            case ARMMMUIdx_E20_2_PAN:
+                user = ARMMMUIdx_E20_0;
+                break;
+            default:
+                break;
+            }
+            m->midx = arm_to_core_mmu_idx(user);
+            if (tlb_fast_off(m->midx) < -512) {
+                return K_STOP;
+            }
+        }
+        return m->prefetch ? K_NOP : K_MEM;
+    }
     if ((insn & 0xFF000000) == 0xD5000000 || (insn & 0xFF000000) == 0xD4000000 ||
         insn == 0xD69F03E0) {
         unsigned off = 0;
@@ -1419,9 +1542,7 @@ static int classify(uint32_t insn, OperandInfo *o, MemInfo *m, bool mem_ok,
     if (fp_copyable(insn, g, j)) {
         return K_FP;
     }
-    if (mem_ok && decode_mem(insn, m, fp_ok)) {
-        return m->prefetch ? K_NOP : K_MEM;
-    }
+
     if (insn == 0xD503201F) {
         return K_NOP;
     }
@@ -1485,11 +1606,6 @@ static void emit_tbi(IJ *j)
     }
 }
 
-static int tlb_fast_off(int mmu_idx)
-{
-    return (int)offsetof(ArchCPU, parent_obj.neg.tlb.f[mmu_idx]) -
-           (int)offsetof(ArchCPU, env);
-}
 
 
 /* x27 = host address of the last byte, x16 = guest address of the last byte */
@@ -1660,7 +1776,7 @@ static void emit_mem(IJ *j, const MemInfo *m, vaddr ipc, IJSlow *sl)
      * bits on top) with the page of the last byte: an access crossing pages
      * misses, as in TCG. x16 = the last byte from here on.
      */
-    emit(j, 0xA9400000 | ((tlb_fast_off(j->mmu_idx) / 8) & 0x7f) << 15 |
+    emit(j, 0xA9400000 | ((tlb_fast_off(m->midx) / 8) & 0x7f) << 15 |
             H_TMP2 << 10 | H_ENV << 5 | H_TMP1);            /* ldp x17, x27, [env, #fast] */
     emit(j, 0x8A000000 | 1 << 22 | H_TMP0 << 16 | (pb - CPU_TLB_ENTRY_BITS) << 10 |
             H_TMP1 << 5 | H_TMP1);                          /* and x17, x17, x16, lsr #.. */
@@ -1803,7 +1919,7 @@ static void emit_slow(IJ *j, const IJSlow *sl, uint32_t *save, uint32_t *restore
     const MemInfo *m = &sl->m;
     int accsize = (1 << m->size) * (m->pair ? 2 : 1);
     MemOp mop = m->size | MO_LE | (m->sign ? MO_SIGN : 0);
-    MemOpIdx oi = make_memop_idx(mop, j->mmu_idx);
+    MemOpIdx oi = make_memop_idx(mop, m->midx);
     uint32_t *adr;
 
     *sl->cbnz = sl->allslow ? i_b(j->ptr - sl->cbnz) :
@@ -1823,7 +1939,7 @@ static void emit_slow(IJ *j, const IJSlow *sl, uint32_t *save, uint32_t *restore
         emit_movi(j, 2, sl->insn);
         adr = j->ptr;
         emit(j, i_adr(3, (sl->resume - adr) * 4));
-        emit_movi(j, 4, j->mmu_idx);
+        emit_movi(j, 4, m->midx);
         emit_movi(j, H_TMP0, (uintptr_t)ishjit_atomic_slow);
         emit(j, i_blr(H_TMP0));
         adr = j->ptr;
@@ -1843,7 +1959,7 @@ static void emit_slow(IJ *j, const IJSlow *sl, uint32_t *save, uint32_t *restore
     if (m->vec) {
         /* through env's image of the V registers, 8 bytes at a time */
         int hsz = MIN(m->size, 3);
-        MemOpIdx voi = make_memop_idx(hsz | MO_LE, j->mmu_idx);
+        MemOpIdx voi = make_memop_idx(hsz | MO_LE, m->midx);
 
         emit(j, i_mov_x(20, 1));
         for (int k = 0; k < (m->pair ? 2 : 1); k++) {
@@ -1998,6 +2114,53 @@ static void emit_spcheck(IJ *j, vaddr ipc)
     *ok = 0x37000000 | 0 << 19 | ((j->ptr - ok) & 0x3fff) << 5 | H_TMP1;
 }
 
+
+
+/*
+ * An exception taken from generated code without leaving it: what
+ * raise_exception() and then cpu_exec's cpu_handle_exception() do (the
+ * exception fields, do_interrupt under the BQL), minus the longjmp and the
+ * trip through cpu_exec. The caller stored the registers and set env->pc
+ * to the return address, then continues at the vector (emit_continue_or_exit).
+ */
+void ishjit_take_exception(CPUARMState *env, uint32_t excp, uint32_t syn);
+void ishjit_take_exception(CPUARMState *env, uint32_t excp, uint32_t syn)
+{
+    CPUState *cs = env_cpu(env);
+
+    cs->exception_index = excp;
+    env->exception.syndrome = syn;
+    env->exception.target_el = exception_target_el(env);
+    bql_lock();
+    cs->cc->tcg_ops->do_interrupt(cs);
+    bql_unlock();
+    cs->exception_index = -1;
+}
+
+/*
+ * After a helper that may unmask interrupts (ERET, DAIFClr), registers
+ * stored, env->pc the next insn's: back to cpu_exec only with an interrupt
+ * pending (as TCG's exit), else straight to the next TB (its full entry).
+ */
+static void emit_continue_or_exit(IJ *j)
+{
+    int ir_off = (int)offsetof(ArchCPU, parent_obj.interrupt_request) -
+                 (int)offsetof(ArchCPU, env);
+    uint32_t *pending;
+
+    emit_movi(j, H_TMP0, (uint64_t)(int64_t)ir_off);
+    emit(j, 0xB8606800 | H_TMP0 << 16 | H_ENV << 5 | H_TMP0);   /* ldr w16, [env, x16] */
+    pending = j->ptr;
+    emit(j, 0);                                     /* cbnz w16, exit */
+    emit(j, i_mov_x(0, H_ENV));
+    emit_movi(j, H_TMP0, (uintptr_t)helper_lookup_tb_ptr);
+    emit(j, i_blr(H_TMP0));
+    emit(j, i_br(0));
+    *pending = 0x35000000 | ((j->ptr - pending) & 0x7ffff) << 5 | H_TMP0;
+    emit_movi(j, H_TMP0, (uintptr_t)tcg_code_gen_epilogue);
+    emit(j, i_br(H_TMP0));
+}
+
 static int ishjit_gen(CPUState *cs, TranslationBlock *tb, vaddr pc,
                       void *host_pc, int max_insns, void *buf)
 {
@@ -2040,6 +2203,7 @@ static int ishjit_gen(CPUState *cs, TranslationBlock *tb, vaddr pc,
     j->fgt_active = EX_TBFLAG_ANY(tbf, FGT_ACTIVE);
     j->fgt_svc = EX_TBFLAG_ANY(tbf, FGT_SVC);
     j->trap_eret = EX_TBFLAG_A64(tbf, TRAP_ERET);
+    j->unpriv = EX_TBFLAG_A64(tbf, UNPRIV);
     j->el2_el3 = arm_feature(env, ARM_FEATURE_EL2) || arm_feature(env, ARM_FEATURE_EL3);
     static int nomem = -1;
     if (nomem < 0) {
@@ -2205,7 +2369,16 @@ static int ishjit_gen(CPUState *cs, TranslationBlock *tb, vaddr pc,
             case K_NOP:
                 break;
             case K_COPY:
-                emit(j, insn);                      /* dmb, dsb: the host's */
+                /*
+                 * dmb: the host's own; dsb: a dmb ish too, as TCG (what a
+                 * dsb waits for, TLB and device operations, is emulated: the
+                 * host's dsb would only cost hundreds of cycles)
+                 */
+                if ((insn & 0xFFFFF0FF) == 0xD503309F) {
+                    emit(j, 0xD5033BBF);            /* dmb ish */
+                } else {
+                    emit(j, insn);
+                }
                 break;
             case K_CLREX:
                 emit(j, 0x92800000 | H_TMP1);       /* mov x17, #-1 */
@@ -2269,12 +2442,14 @@ static int ishjit_gen(CPUState *cs, TranslationBlock *tb, vaddr pc,
                     emit_movi(j, 1, EXCP_SWI);
                     emit_movi(j, 2, syn_aa64_svc(imm));
                     emit_movi(j, H_TMP0, (uintptr_t)helper_exception_with_syndrome);
+                    emit(j, i_blr(H_TMP0));
+                    emit(j, 0xD4200000);            /* (noreturn) brk #0 */
                 } else {
                     emit_movi(j, 1, syn_aa64_bkpt(imm));
                     emit_movi(j, H_TMP0, (uintptr_t)helper_exception_bkpt_insn);
+                    emit(j, i_blr(H_TMP0));
+                    emit(j, 0xD4200000);            /* (noreturn) brk #0 */
                 }
-                emit(j, i_blr(H_TMP0));
-                emit(j, 0xD4200000);                /* (noreturn) brk #0 */
                 break;
             }
             case K_ERET:
@@ -2285,43 +2460,44 @@ static int ishjit_gen(CPUState *cs, TranslationBlock *tb, vaddr pc,
                 emit(j, i_mov_x(0, H_ENV));
                 emit_movi(j, H_TMP0, (uintptr_t)helper_exception_return);
                 emit(j, i_blr(H_TMP0));
-                /* to cpu_exec (as TCG: the new state may unmask interrupts) */
-                emit_movi(j, H_TMP0, (uintptr_t)tcg_code_gen_epilogue);
-                emit(j, i_br(H_TMP0));
+                emit_continue_or_exit(j);
                 break;
             case K_ISB:
                 end_off[i] = ij_offset(j);
                 emit_jump(j, 0, ipc + 4);           /* (ends the TB, as TCG) */
                 break;
             case K_DAIFSET:
-            case K_DAIFCLR:
+            case K_DAIFCLR: {
                 /*
-                 * QEMU's helper (it may change the TB flags, so the TB ends,
-                 * as TCG's): registers stored first, the call clobbers them
+                 * Inline (no TB flags depend on DAIF; EL1, no traps):
+                 * env->daif |= or &= ~ the bits. Clearing them: an
+                 * interrupt already pending is taken now, from cpu_exec.
                  */
-                end_off[i] = ij_offset(j);
-                emit_vstore(j, j->vwritten);
-                emit_sync(j);
-                emit(j, i_mov_x(0, H_ENV));
-                emit_movi(j, 1, (insn >> 8) & 15);
-                emit_movi(j, H_TMP0, (uintptr_t)(kinds[i] == K_DAIFSET ?
-                                                 (void *)helper_msr_i_daifset :
-                                                 (void *)helper_msr_i_daifclear));
-                emit(j, i_blr(H_TMP0));
-                emit_pc_add(j, (int64_t)(ipc + 4 - j->pc_first));
-                if (kinds[i] == K_DAIFSET) {
-                    /* on: a plain (registers-stored) chained jump */
-                    tb->jmp_insn_offset[0] = ij_offset(j);
-                    emit(j, 0x14000000);
-                    emit(j, i_br(H_TMP0));
-                    tb->jmp_reset_offset[0] = ij_offset(j);
-                    emit_exit_tb(j, 0);
-                } else {
-                    /* to cpu_exec, where an interrupt now unmasked is taken */
+                uint64_t bits = (uint64_t)((insn >> 8) & 15) << 6;
+                uint32_t *none;
+
+                emit(j, i_ldr_x(H_TMP0, H_ENV, offsetof(CPUARMState, daif)));
+                emit_movi(j, H_TMP1, bits);
+                emit(j, (kinds[i] == K_DAIFSET ? 0xAA000000 : 0x8A200000) |
+                        H_TMP1 << 16 | H_TMP0 << 5 | H_TMP0);   /* orr / bic x16, x16, x17 */
+                emit(j, i_str_x(H_TMP0, H_ENV, offsetof(CPUARMState, daif)));
+                if (kinds[i] == K_DAIFCLR) {
+                    int ir_off = (int)offsetof(ArchCPU, parent_obj.interrupt_request) -
+                                 (int)offsetof(ArchCPU, env);
+
+                    emit_movi(j, H_TMP0, (uint64_t)(int64_t)ir_off);
+                    emit(j, 0xB8606800 | H_TMP0 << 16 | H_ENV << 5 | H_TMP0);  /* ldr w16, [env, x16] */
+                    none = j->ptr;
+                    emit(j, 0);                             /* cbz w16, on */
+                    emit_vstore(j, j->vwritten);
+                    emit_sync(j);
+                    emit_pc_add(j, (int64_t)(ipc + 4 - j->pc_first));
                     emit_movi(j, H_TMP0, (uintptr_t)tcg_code_gen_epilogue);
                     emit(j, i_br(H_TMP0));
+                    *none = 0x34000000 | ((j->ptr - none) & 0x7ffff) << 5 | H_TMP0;
                 }
                 break;
+            }
             case K_FP: {
                 const SimdOperands *g = &simds[i];
                 uint32_t rd, wr, vv, mem, out = insn;
