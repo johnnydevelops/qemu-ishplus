@@ -3384,6 +3384,15 @@ static void tcg_target_qemu_prologue(TCGContext *s)
         tcg_out_insn(s, 3314, STP, r, r + 1, TCG_REG_SP, ofs, 1, 0);
     }
 
+    /*
+     * iSH+: and d8..d15 (callee-saved too): TCG never uses v8..v15, but
+     * ishjit TBs keep guest vector registers in all of v0..v31.
+     */
+    tcg_out32(s, 0x6dbf27e8);       /* stp d8, d9, [sp, #-16]! */
+    tcg_out32(s, 0x6dbf2fea);       /* stp d10, d11, [sp, #-16]! */
+    tcg_out32(s, 0x6dbf37ec);       /* stp d12, d13, [sp, #-16]! */
+    tcg_out32(s, 0x6dbf3fee);       /* stp d14, d15, [sp, #-16]! */
+
     /* Make stack space for TCG locals.  */
     tcg_out_insn(s, 3401, SUBI, TCG_TYPE_I64, TCG_REG_SP, TCG_REG_SP,
                  FRAME_SIZE - PUSH_SIZE);
@@ -3421,6 +3430,12 @@ static void tcg_target_qemu_prologue(TCGContext *s)
     /* Remove TCG locals stack space.  */
     tcg_out_insn(s, 3401, ADDI, TCG_TYPE_I64, TCG_REG_SP, TCG_REG_SP,
                  FRAME_SIZE - PUSH_SIZE);
+
+    /* iSH+: d8..d15 */
+    tcg_out32(s, 0x6cc13fee);       /* ldp d14, d15, [sp], #16 */
+    tcg_out32(s, 0x6cc137ec);       /* ldp d12, d13, [sp], #16 */
+    tcg_out32(s, 0x6cc12fea);       /* ldp d10, d11, [sp], #16 */
+    tcg_out32(s, 0x6cc127e8);       /* ldp d8, d9, [sp], #16 */
 
     /* Restore registers x19..x28.  */
     for (r = TCG_REG_X19; r <= TCG_REG_X27; r += 2) {

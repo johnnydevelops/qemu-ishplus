@@ -33,6 +33,7 @@
 #include "tb-context.h"
 #include "tb-internal.h"
 #include "internal-common.h"
+#include "qemu/cacheflush.h"
 #include "internal-target.h"
 #ifdef CONFIG_USER_ONLY
 #include "user/page-protection.h"
@@ -868,6 +869,28 @@ void tb_reset_jump(TranslationBlock *tb, int n)
 {
     uintptr_t addr = (uintptr_t)(tb->tc.ptr + tb->jmp_reset_offset[n]);
     tb_set_jmp_target(tb, n, addr);
+    if (tb->ishjit_fast && tb->ishjit_jmp2[n]) {
+        ishjit_set_jmp2(tb, n, (uintptr_t)tb->tc.ptr + tb->ishjit_jmp2_reset[n]);
+    }
+}
+
+/*
+ * iSH+: points an ishjit TB's second patch point (a "b") at @addr, or at its
+ * unchained target when @addr is out of a direct branch's reach.
+ */
+void ishjit_set_jmp2(TranslationBlock *tb, int n, uintptr_t addr)
+{
+#ifdef __aarch64__
+    uintptr_t rx = (uintptr_t)tb->tc.ptr + tb->ishjit_jmp2[n];
+    ptrdiff_t d = addr - rx;
+    uint32_t *rw = (uint32_t *)(rx - tcg_splitwx_diff);
+
+    if (d != sextract64(d, 0, 28)) {
+        d = (uintptr_t)tb->tc.ptr + tb->ishjit_jmp2_reset[n] - rx;
+    }
+    qatomic_set(rw, 0x14000000 | ((d >> 2) & 0x3ffffff));
+    flush_idcache_range(rx, (uintptr_t)rw, 4);
+#endif
 }
 
 /* remove any jumps to the TB */

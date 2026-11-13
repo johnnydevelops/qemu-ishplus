@@ -654,7 +654,17 @@ static inline void tb_add_jump(TranslationBlock *tb, int n,
     }
 
     /* patch the native jump address */
-    tb_set_jmp_target(tb, n, (uintptr_t)tb_next->tc.ptr);
+    if (tb->ishjit_fast && tb->ishjit_jmp2[n]) {
+        /* iSH+: ishjit to ishjit with the registers in place, else stored */
+        if (tb_next->ishjit_fast) {
+            tb_set_jmp_target(tb, n, (uintptr_t)tb_next->tc.ptr +
+                                     tb_next->ishjit_fast);
+        } else {
+            ishjit_set_jmp2(tb, n, (uintptr_t)tb_next->tc.ptr);
+        }
+    } else {
+        tb_set_jmp_target(tb, n, (uintptr_t)tb_next->tc.ptr);
+    }
 
     /* add in TB jmp list */
     tb->jmp_list_next[n] = tb_next->jmp_list_head;

@@ -127,6 +127,15 @@ struct TranslationBlock {
     uint16_t jmp_reset_offset[2]; /* offset of original jump target */
     uint16_t jmp_insn_offset[2];  /* offset of direct jump insn */
     uintptr_t jmp_target_addr[2]; /* target address */
+    /*
+     * iSH+ ishjit TBs (target/arm/tcg/ishjit.c): the offset of their fast
+     * entry (guest registers already in host registers; 0: not an ishjit
+     * TB), and per jump the second patch point, taken to a TCG TB after the
+     * registers are stored, and its unchained target.
+     */
+    uint16_t ishjit_fast;
+    uint16_t ishjit_jmp2[2];
+    uint16_t ishjit_jmp2_reset[2];
 
     /*
      * Each TB has a NULL-terminated list (jmp_list_head) of incoming jumps.
