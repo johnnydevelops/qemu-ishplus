@@ -2188,6 +2188,27 @@ void tb_target_set_jmp_target(const TranslationBlock *tb, int n,
     }
     qatomic_set((uint32_t *)jmp_rw, insn);
     flush_idcache_range(jmp_rx, jmp_rw, 4);
+
+    /*
+     * iSH+ ishjit: a conditional branch whose taken way is only this jump
+     * goes straight to the next TB too, when in its reach; to the jump
+     * when unchained (patched after the jump, so both ways stay valid)
+     */
+    if (tb->ishjit_fast && tb->ishjit_cbr[n]) {
+        uintptr_t c_rx = (uintptr_t)tb->tc.ptr + tb->ishjit_cbr[n];
+        uintptr_t c_rw = c_rx - tcg_splitwx_diff;
+        uint32_t ci = qatomic_read((uint32_t *)c_rx);
+        bool tbz = (ci & 0x7E000000) == 0x36000000;
+        uintptr_t reset = (uintptr_t)tb->tc.ptr + tb->ishjit_reset[n];
+        ptrdiff_t d = (d_addr == reset ? jmp_rx : d_addr) - c_rx;
+
+        if (d != sextract64(d, 0, tbz ? 16 : 21)) {
+            d = jmp_rx - c_rx;
+        }
+        ci = tbz ? deposit32(ci, 5, 14, d >> 2) : deposit32(ci, 5, 19, d >> 2);
+        qatomic_set((uint32_t *)c_rw, ci);
+        flush_idcache_range(c_rx, c_rw, 4);
+    }
 }
 
 static void tcg_out_op(TCGContext *s, TCGOpcode opc, TCGType ext,

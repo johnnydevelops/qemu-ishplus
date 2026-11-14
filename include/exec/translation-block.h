@@ -145,6 +145,7 @@ struct TranslationBlock {
     int32_t ishjit_jmp2[TB_MAX_JMPS];   /* (cold code: after the TB, far) */
     int32_t ishjit_jmp2_reset[TB_MAX_JMPS];
     int32_t ishjit_reset[TB_MAX_JMPS];  /* (unchained: cold code, or 0) */
+    uint16_t ishjit_cbr[TB_MAX_JMPS];   /* (a conditional branch to it, or 0) */
 
     /*
      * Each TB has a NULL-terminated list (jmp_list_head) of incoming jumps.

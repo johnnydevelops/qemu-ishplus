@@ -358,6 +358,7 @@ TranslationBlock *tb_gen_code(CPUState *cpu,
     for (int n = 0; n < TB_MAX_JMPS; n++) {
         tb->ishjit_jmp2[n] = 0;
         tb->ishjit_reset[n] = 0;
+        tb->ishjit_cbr[n] = 0;
         tb->jmp_reset_offset[n] = TB_JMP_OFFSET_INVALID;
         tb->jmp_insn_offset[n] = TB_JMP_OFFSET_INVALID;
     }

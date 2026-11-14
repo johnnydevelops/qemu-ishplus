@@ -1450,6 +1450,27 @@ static void emit_jump(IJ *j, vaddr dest)
     }
 }
 
+/*
+ * A conditional branch's taken way (the branch at @br goes here): when it
+ * is only the jump's patch point, the branch itself is patched too, to go
+ * straight to the next TB when in its reach (tb->ishjit_cbr,
+ * tb_target_set_jmp_target)
+ */
+static int cbr_on = -1;
+static void emit_cond_jump(IJ *j, vaddr dest, uint32_t *br)
+{
+    int slot = j->nslot;
+    intptr_t at = ij_offset(j);
+
+    if (cbr_on < 0) {
+        cbr_on = !getenv("ISHJIT_NOCBR");
+    }
+    emit_jump(j, dest);
+    if (cbr_on && j->nslot > slot && j->tb->jmp_insn_offset[slot] == at) {
+        j->tb->ishjit_cbr[slot] = (uint8_t *)br - (uint8_t *)j->start;
+    }
+}
+
 /* The guest value of a register read by a branch (host reg or scratch) */
 static int branch_src(IJ *j, int g)
 {
@@ -3722,7 +3743,7 @@ static int ishjit_gen(CPUState *cs, TranslationBlock *tb, vaddr pc,
                 if (dest >= j->pc_first && dest < j->pc_first + 4 * n) {
                     emit_xcount(j, XC_CT_IN, 1);
                 }
-                emit_jump(j, dest);
+                emit_cond_jump(j, dest, br);
                 break;
             }
             case K_BREG: {
@@ -3791,7 +3812,7 @@ static int ishjit_gen(CPUState *cs, TranslationBlock *tb, vaddr pc,
             if (((sbt[k].dest ^ j->pc_first) & TARGET_PAGE_MASK) == 0) {
                 emit_xcount(j, XC_CT_PAGE, 1);
             }
-            emit_jump(j, sbt[k].dest);
+            emit_cond_jump(j, sbt[k].dest, sbt[k].br);
         }
         j->vwritten = vwat[last];
         for (int k = 0; k < j->ntramp; k++) {
@@ -4039,6 +4060,7 @@ static int ishjit_gen_code(CPUState *cs, TranslationBlock *tb, vaddr pc,
     for (int w = 0; w < TB_MAX_JMPS; w++) {
         tb->ishjit_jmp2[w] = 0;
         tb->ishjit_reset[w] = 0;
+        tb->ishjit_cbr[w] = 0;
         tb->jmp_insn_offset[w] = TB_JMP_OFFSET_INVALID;
         tb->jmp_reset_offset[w] = TB_JMP_OFFSET_INVALID;
     }
