@@ -23,6 +23,7 @@
  */
 
 #include "qemu/osdep.h"
+#include <dlfcn.h>
 #include "qemu/units.h"
 #include "qemu/madvise.h"
 #include "qemu/mprotect.h"
@@ -791,10 +792,26 @@ static int alloc_code_gen_buffer_splitwx_ios(size_t size, Error **errp)
     bool from_debugger = false;
 
     if (is_debugger_attached()) {
+        /*
+         * The debugger allocates first-fit, with no address hint. With no
+         * low gap big enough left, it gets 0x7000000000, in the extended
+         * address range (com.apple.developer.kernel.extended-virtual-
+         * addressing), where generated code hangs on its first instruction
+         * (the guest never starts). iSH+ reserves a low gap at launch
+         * (JITHelperLauncher.m); freed now, it is where the allocation lands.
+         */
+        void (*release_placeholder)(void) =
+            dlsym(RTLD_DEFAULT, "ishplus_jit_release_placeholder");
+        if (release_placeholder) {
+            release_placeholder();
+        }
         buf_rx = ios_debugger_alloc_rx(size);
         from_debugger = buf_rx != NULL;
         if (buf_rx == NULL) {
             error_report("JIT: the debugger did not allocate executable memory");
+        } else if ((uintptr_t)buf_rx >= 0xfc0000000ull) {
+            error_report("JIT: executable memory at %p, above the usual address "
+                         "range: Linux may not start (restart iSH+)", buf_rx);
         }
     }
     if (buf_rx == NULL) {
