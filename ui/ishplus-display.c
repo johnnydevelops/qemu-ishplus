@@ -37,6 +37,8 @@ void ishplus_display_set_size(int width, int height);
 void ishplus_input_pointer(int x, int y);
 void ishplus_input_button(int button, int down);
 void ishplus_input_scroll(int dx, int dy);
+void ishplus_input_set_relative(int relative);
+void ishplus_input_motion(int dx, int dy);
 void ishplus_input_key(int usb_usage, int down);
 void ishplus_gpu_pause(int pause);
 
@@ -285,6 +287,35 @@ void ishplus_input_pointer(int x, int y)
     if (con) {
         qemu_input_queue_abs(con, INPUT_AXIS_X, x, 0, surface_size(con, false));
         qemu_input_queue_abs(con, INPUT_AXIS_Y, y, 0, surface_size(con, true));
+        qemu_input_event_sync();
+    }
+    unlock(locked);
+}
+
+/*
+ * A captured mouse: relative motion, in the guest's pixels, to the relative
+ * mouse (virtio-mouse), which then also gets the buttons and wheel; off,
+ * the absolute tablet (ishplus_input_pointer) gets them again.
+ */
+void ishplus_input_set_relative(int relative)
+{
+    bool locked;
+
+    lock(&locked);
+    qemu_input_handler_activate_mask(relative ? INPUT_EVENT_MASK_REL : INPUT_EVENT_MASK_ABS);
+    unlock(locked);
+}
+
+void ishplus_input_motion(int dx, int dy)
+{
+    bool locked;
+    QemuConsole *con;
+
+    lock(&locked);
+    con = input_console();
+    if (con && (dx || dy)) {
+        qemu_input_queue_rel(con, INPUT_AXIS_X, dx);
+        qemu_input_queue_rel(con, INPUT_AXIS_Y, dy);
         qemu_input_event_sync();
     }
     unlock(locked);

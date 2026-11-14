@@ -74,6 +74,22 @@ void qemu_input_handler_deactivate(QemuInputHandlerState *s)
     notifier_list_notify(&mouse_mode_notifiers, NULL);
 }
 
+/*
+ * iSH+: put the first device taking these events first (relative motion for
+ * a captured mouse, absolute for the tablet), so it also gets the buttons.
+ */
+void qemu_input_handler_activate_mask(uint32_t mask)
+{
+    QemuInputHandlerState *s;
+
+    QTAILQ_FOREACH(s, &handlers, node) {
+        if (s->handler->mask & mask) {
+            qemu_input_handler_activate(s);
+            return;
+        }
+    }
+}
+
 void qemu_input_handler_unregister(QemuInputHandlerState *s)
 {
     QTAILQ_REMOVE(&handlers, s, node);
