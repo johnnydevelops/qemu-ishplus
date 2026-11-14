@@ -1878,7 +1878,7 @@ void ishjit_atomic_slow(CPUARMState *env, uint64_t addr, uint32_t insn,
 }
 
 enum { K_STOP, K_DP, K_NOP, K_ADR, K_MEM, K_FP, K_COPY, K_CLREX, K_MRS, K_MSR,
-       K_MRSCONST, K_DAIFSET, K_DAIFCLR, K_DCZVA, K_MSRDAIF, K_MRSIO,
+       K_MRSCONST, K_DAIFSET, K_DAIFCLR, K_DCZVA, K_MSRDAIF, K_MRSIO, K_DCZID,
        K_B, K_BL, K_BCOND, K_CB, K_TB, K_BREG, K_SVC, K_BRK, K_ERET, K_ISB };
 
 /* System instructions ishjit handles itself (others: TCG) */
@@ -1968,6 +1968,13 @@ static int classify_sys(uint32_t insn, IJ *j, unsigned *off, bool *spcheck)
          * the vDSO's clock_gettime): their readfn through the slow path
          * (no EL2: allowed at EL1, at EL0 if CNTKCTL_EL1.EL0[PV]CTEN)
          */
+        /* DCZID_EL0 (glibc's memset reads it): as aa64_dczid_read */
+        if (isread && op0 == 3 && op1 == 3 && crn == 0 && crm == 0 && op2 == 7 &&
+            !j->el2_el3 && j->el <= 1 && !j->fgt_active &&
+            env_archcpu(j->env)->dcz_blocksize < 16 &&
+            offsetof(CPUARMState, cp15.sctlr_el[1]) / 8 <= 4095) {
+            return K_DCZID;
+        }
         if (isread && op0 == 3 && op1 == 3 && crn == 14 && crm == 0 &&
             (op2 == 1 || op2 == 2 || op2 == 5 || op2 == 6) &&
             ri->readfn && !j->el2_el3 && j->el <= 1) {
@@ -3080,10 +3087,10 @@ static int ishjit_gen(CPUState *cs, TranslationBlock *tb, vaddr pc,
      * Superblocks: the block goes on after a conditional branch (its
      * fall-through), the taken way an exit of its own; up to sb_max of them
      */
-    struct { uint32_t *br; uint32_t insn; int kind; vaddr dest; uint32_t vw; }
+    struct { uint32_t *br; uint32_t insn; int kind; vaddr dest; uint32_t vw; int src; }
         sbt[TB_MAX_JMPS];
     int nsbt = 0, ncond = 0, lastcond = -1;
-    static int sb_max = -1, sb_calls, sb_cond, sb_groups;
+    static int sb_max = -1, sb_calls, sb_cond, sb_groups, nocbenv;
     int n = 0, last;
     intptr_t slow0 = 0;
     uint32_t *full_b = NULL;
@@ -3139,6 +3146,7 @@ static int ishjit_gen(CPUState *cs, TranslationBlock *tb, vaddr pc,
         /* (and calls go on with the code after them, in the TB itself) */
         sb_calls = !getenv("ISHJIT_NOSBCALL");
         sb_cond = !getenv("ISHJIT_NOSBCOND");
+        nocbenv = getenv("ISHJIT_NOCBENV") != NULL;
         sb_groups = !getenv("ISHJIT_NOSBGROUP");
     }
     j->mem_ok = !nomem && !EX_TBFLAG_ANY(tbf, ALIGN_MEM) &&
@@ -3174,6 +3182,7 @@ static int ishjit_gen(CPUState *cs, TranslationBlock *tb, vaddr pc,
             wr = (insn & 31) == 31 ? 0 : 1u << (insn & 31);
             break;
         case K_MRSIO:
+        case K_DCZID:
             wr = (insn & 31) == 31 ? 0 : 1u << (insn & 31);
             break;
         case K_MSRDAIF:
@@ -3238,12 +3247,12 @@ static int ishjit_gen(CPUState *cs, TranslationBlock *tb, vaddr pc,
         if (k == K_STOP) {
             break;
         }
-        /* env-held registers: at most three per DP insn, none for cb/tb */
+        /* env-held registers: at most three per DP insn (cb/tb: x17) */
         {
             uint32_t mem = (rd | wr) & ENV_HELD;
 
             if (((k == K_DP || k == K_FP) && ctpop32(mem) > 3) ||
-                ((k == K_CB || k == K_TB) && mem)) {
+                ((k == K_CB || k == K_TB) && mem && nocbenv)) {
                 break;
             }
         }
@@ -3601,6 +3610,29 @@ static int ishjit_gen(CPUState *cs, TranslationBlock *tb, vaddr pc,
                 }
                 break;
             }
+            case K_DCZID: {
+                /* the block size, DZP: DC ZVA not allowed (EL0, SCTLR_EL1.DZE 0) */
+                int g = insn & 31, h = g2h[g] == H_NONE ? H_TMP0 : g2h[g];
+                unsigned bs = env_archcpu(j->env)->dcz_blocksize;
+
+                if (g == 31) {
+                    break;
+                }
+                if (j->el == 0) {
+                    emit(j, i_ldr_x(H_TMP0, H_ENV, offsetof(CPUARMState, cp15.sctlr_el[1])));
+                    emit(j, 0xD3400000 | 14 << 16 | 14 << 10 | H_TMP0 << 5 | H_TMP0);  /* ubfx x16, x16, #14, #1 */
+                    emit(j, 0xD2400000 | H_TMP0 << 5 | H_TMP0);                       /* eor x16, x16, #1 */
+                    emit(j, 0xD37CEC00 | H_TMP0 << 5 | H_TMP0);                       /* lsl x16, x16, #4 */
+                    emit_movi(j, H_TMP1, bs);
+                    emit(j, 0xAA000000 | H_TMP1 << 16 | H_TMP0 << 5 | h);             /* orr xd, x16, x17 */
+                } else {
+                    emit_movi(j, h, bs);
+                }
+                if (g2h[g] == H_NONE) {
+                    emit(j, i_str_x(h, H_ENV, xreg_off(g)));
+                }
+                break;
+            }
             case K_MRSIO: {
                 IJSlow *sl = &slows[j->nslow];
                 int op2 = (insn >> 5) & 7;
@@ -3787,16 +3819,20 @@ static int ishjit_gen(CPUState *cs, TranslationBlock *tb, vaddr pc,
             case K_TB: {
                 vaddr dest;
                 uint32_t *br;
+                int src;
 
                 if (kinds[i] == K_BCOND || kinds[i] == K_CB) {
                     dest = ipc + (sextract64(insn, 5, 19) << 2);
                 } else {
                     dest = ipc + (sextract64(insn, 5, 14) << 2);
                 }
+                /* (cbz/tbz: the register, an env-held one loaded to x17 first) */
+                src = kinds[i] == K_BCOND ? 0 : branch_src(j, insn & 31);
                 end_off[i] = ij_offset(j);
                 if (i != last) {
                     /* (a superblock's: the taken way's exit after the hot code) */
                     g_assert(nsbt < TB_MAX_JMPS);
+                    sbt[nsbt].src = src;
                     sbt[nsbt].br = j->ptr;
                     sbt[nsbt].insn = insn;
                     sbt[nsbt].kind = kinds[i];
@@ -3820,10 +3856,10 @@ static int ishjit_gen(CPUState *cs, TranslationBlock *tb, vaddr pc,
                         *br = (insn & 0xFF00001F) | (d & 0x7ffff) << 5;
                     } else if (kinds[i] == K_CB) {
                         *br = (insn & 0xFF00001F & ~0x1Fu) |
-                              branch_src(j, insn & 31) | (d & 0x7ffff) << 5;
+                              src | (d & 0x7ffff) << 5;
                     } else {
                         *br = (insn & 0xFFF8001F & ~0x1Fu) |
-                              branch_src(j, insn & 31) | (d & 0x3fff) << 5;
+                              src | (d & 0x3fff) << 5;
                     }
                 }
                 emit_xcount(j, XC_CT, 1);
@@ -3889,13 +3925,13 @@ static int ishjit_gen(CPUState *cs, TranslationBlock *tb, vaddr pc,
                 *sbt[k].br = (insn & 0xFF00001F) | (d & 0x7ffff) << 5;
             } else if (sbt[k].kind == K_CB) {
                 *sbt[k].br = (insn & 0xFF00001F & ~0x1Fu) |
-                             branch_src(j, insn & 31) | (d & 0x7ffff) << 5;
+                             sbt[k].src | (d & 0x7ffff) << 5;
             } else {
                 if (d != sextract64(d, 0, 14)) {
                     return -2;                  /* (tbz: beyond 32 KB) */
                 }
                 *sbt[k].br = (insn & 0xFFF8001F & ~0x1Fu) |
-                             branch_src(j, insn & 31) | (d & 0x3fff) << 5;
+                             sbt[k].src | (d & 0x3fff) << 5;
             }
             j->vwritten = sbt[k].vw;
             emit_xcount(j, XC_CT, 1);
