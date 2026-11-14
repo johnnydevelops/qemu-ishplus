@@ -1835,7 +1835,7 @@ void ishjit_atomic_slow(CPUARMState *env, uint64_t addr, uint32_t insn,
 }
 
 enum { K_STOP, K_DP, K_NOP, K_ADR, K_MEM, K_FP, K_COPY, K_CLREX, K_MRS, K_MSR,
-       K_MRSCONST, K_DAIFSET, K_DAIFCLR, K_DCZVA,
+       K_MRSCONST, K_DAIFSET, K_DAIFCLR, K_DCZVA, K_MSRDAIF,
        K_B, K_BL, K_BCOND, K_CB, K_TB, K_BREG, K_SVC, K_BRK, K_ERET, K_ISB };
 
 /* System instructions ishjit handles itself (others: TCG) */
@@ -1889,6 +1889,9 @@ static int classify_sys(uint32_t insn, IJ *j, unsigned *off, bool *spcheck)
     }
     if ((insn & 0xFFFFF0FF) == 0xD50340FF) {            /* msr daifclr, #imm */
         return j->el == 1 ? K_DAIFCLR : K_STOP;
+    }
+    if ((insn & 0xFFFFFFE0) == 0xD51B4220) {            /* msr daif, xt */
+        return j->el == 1 && !j->fgt_active ? K_MSRDAIF : K_STOP;
     }
     if ((insn & 0xFFE0001F) == 0xD4000001) {            /* svc */
         return j->el == 0 && !j->fgt_svc ? K_SVC : K_STOP;
@@ -3092,6 +3095,7 @@ static int ishjit_gen(CPUState *cs, TranslationBlock *tb, vaddr pc,
         case K_MRSCONST:
             wr = (insn & 31) == 31 ? 0 : 1u << (insn & 31);
             break;
+        case K_MSRDAIF:
         case K_DCZVA:
             rd = (insn & 31) == 31 ? 0 : 1u << (insn & 31);
             memset(&mems[n], 0, sizeof(mems[n]));
@@ -3429,6 +3433,7 @@ static int ishjit_gen(CPUState *cs, TranslationBlock *tb, vaddr pc,
                 end_off[i] = ij_offset(j);
                 emit_jump(j, ipc + 4);              /* (ends the TB, as TCG) */
                 break;
+            case K_MSRDAIF:
             case K_DAIFSET:
             case K_DAIFCLR: {
                 /*
@@ -3439,12 +3444,24 @@ static int ishjit_gen(CPUState *cs, TranslationBlock *tb, vaddr pc,
                 uint64_t bits = (uint64_t)((insn >> 8) & 15) << 6;
                 uint32_t *none;
 
-                emit(j, i_ldr_x(H_TMP0, H_ENV, offsetof(CPUARMState, daif)));
-                emit_movi(j, H_TMP1, bits);
-                emit(j, (kinds[i] == K_DAIFSET ? 0xAA000000 : 0x8A200000) |
-                        H_TMP1 << 16 | H_TMP0 << 5 | H_TMP0);   /* orr / bic x16, x16, x17 */
+                if (kinds[i] == K_MSRDAIF) {
+                    /* (as aa64_daif_write: env->daif = xt & PSTATE_DAIF) */
+                    int g = insn & 31, h = g == 31 ? 31 : g2h[g];
+
+                    QEMU_BUILD_BUG_ON(PSTATE_DAIF != 0x3c0);
+                    if (h == H_NONE) {
+                        emit(j, i_ldr_x(H_TMP0, H_ENV, xreg_off(g)));
+                        h = H_TMP0;
+                    }
+                    emit(j, 0x92400000 | 58 << 16 | 3 << 10 | h << 5 | H_TMP0);  /* and x16, xt, #0x3c0 */
+                } else {
+                    emit(j, i_ldr_x(H_TMP0, H_ENV, offsetof(CPUARMState, daif)));
+                    emit_movi(j, H_TMP1, bits);
+                    emit(j, (kinds[i] == K_DAIFSET ? 0xAA000000 : 0x8A200000) |
+                            H_TMP1 << 16 | H_TMP0 << 5 | H_TMP0);   /* orr / bic x16, x16, x17 */
+                }
                 emit(j, i_str_x(H_TMP0, H_ENV, offsetof(CPUARMState, daif)));
-                if (kinds[i] == K_DAIFCLR) {
+                if (kinds[i] != K_DAIFSET) {
                     int ir_off = (int)offsetof(ArchCPU, parent_obj.interrupt_request) -
                                  (int)offsetof(ArchCPU, env);
 
