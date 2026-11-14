@@ -49,6 +49,7 @@ void helper_exception_bkpt_insn(CPUArchState *env, uint32_t syn);
 void helper_exception_return(CPUArchState *env, uint64_t new_pc);
 void helper_msr_i_daifset(CPUArchState *env, uint32_t imm);
 void helper_msr_i_daifclear(CPUArchState *env, uint32_t imm);
+uint64_t helper_get_cp_reg64(CPUArchState *env, const void *rip);
 
 /*
  * Registers. Host x18 is Apple's (zeroed on context switches), host SP must
@@ -1515,7 +1516,8 @@ enum { M_IMM, M_REG, M_LIT };
  * and with anything ishjit emits between the two.
  */
 enum { A_NONE, A_LDAR, A_LDAPR, A_STLR, A_LSE, A_CAS, A_LDX, A_STX,
-       A_ZVA /* (DC ZVA: a block of zeros; desc IJD_ZVA) */ };
+       A_ZVA /* (DC ZVA: a block of zeros; desc IJD_ZVA) */,
+       A_MRSIO /* (a counter read: through the slow path; IJD_MRSIO) */ };
 enum { WB_NONE, WB_PRE, WB_POST };
 
 typedef struct {
@@ -1876,7 +1878,7 @@ void ishjit_atomic_slow(CPUARMState *env, uint64_t addr, uint32_t insn,
 }
 
 enum { K_STOP, K_DP, K_NOP, K_ADR, K_MEM, K_FP, K_COPY, K_CLREX, K_MRS, K_MSR,
-       K_MRSCONST, K_DAIFSET, K_DAIFCLR, K_DCZVA, K_MSRDAIF,
+       K_MRSCONST, K_DAIFSET, K_DAIFCLR, K_DCZVA, K_MSRDAIF, K_MRSIO,
        K_B, K_BL, K_BCOND, K_CB, K_TB, K_BREG, K_SVC, K_BRK, K_ERET, K_ISB };
 
 /* System instructions ishjit handles itself (others: TCG) */
@@ -1960,6 +1962,17 @@ static int classify_sys(uint32_t insn, IJ *j, unsigned *off, bool *spcheck)
         if (!ri || !cp_access_ok(j->el, ri, isread) ||
             (ri->fgt && j->fgt_active)) {
             goto other;
+        }
+        /*
+         * The counters (CNT[PV]CT[SS]_EL0, the kernel's sched_clock and
+         * the vDSO's clock_gettime): their readfn through the slow path
+         * (no EL2: allowed at EL1, at EL0 if CNTKCTL_EL1.EL0[PV]CTEN)
+         */
+        if (isread && op0 == 3 && op1 == 3 && crn == 14 && crm == 0 &&
+            (op2 == 1 || op2 == 2 || op2 == 5 || op2 == 6) &&
+            ri->readfn && !j->el2_el3 && j->el <= 1) {
+            j->sysconst = (uintptr_t)ri;
+            return K_MRSIO;
         }
         if (ri->accessfn &&
             arm_cpreg_ishplus_access(ri, j->el, j->el2_el3) != 1) {
@@ -2169,6 +2182,7 @@ typedef struct {
     uint32_t *gbr;          /* (its branch there) */
     int gslot;
     vaddr ipc;
+    const void *ri;         /* (A_MRSIO: the ARMCPRegInfo) */
 } IJSlow;
 
 /* x27 = host address of the last byte, x16 = guest address of the last byte */
@@ -2728,6 +2742,7 @@ static const void *st_helper(int size)
 #define IJD_TBID(w)     (((w) >> 25) & 3)
 #define IJD_LIT         (1u << 27)
 #define IJD_ZVA         (1u << 28)
+#define IJD_MRSIO       (1u << 29)
 
 static void emit_slow_desc(IJ *j, const IJSlow *sl, uint32_t *save, uint32_t *restore)
 {
@@ -2743,7 +2758,8 @@ static void emit_slow_desc(IJ *j, const IJSlow *sl, uint32_t *save, uint32_t *re
     *adr = i_adr(H_TMP2, (d - adr) * 4);
     emit(j, m->size | (m->load ? IJD_LOAD : 0) | (m->pair ? IJD_PAIR : 0) |
             (m->sign ? IJD_SIGN : 0) | (m->dest32 ? IJD_DEST32 : 0) |
-            (m->vec ? IJD_VEC : 0) | (m->akind == A_ZVA ? IJD_ZVA : m->akind << 8) |
+            (m->vec ? IJD_VEC : 0) | (m->akind == A_ZVA ? IJD_ZVA :
+                                      m->akind == A_MRSIO ? IJD_MRSIO : m->akind << 8) |
             m->rt << 11 | m->rt2 << 16 |
             m->midx << 21 | (j->tbid & 3) << 25 | (m->mode == M_LIT ? IJD_LIT : 0));
     ij_fixup(FX_C2H_REL, j->ptr, sl->resume, d);
@@ -2751,6 +2767,11 @@ static void emit_slow_desc(IJ *j, const IJSlow *sl, uint32_t *save, uint32_t *re
     emit(j, j->vused ? (uint32_t)((restore - d) * 4) : 0);
     if (atomic) {
         emit(j, sl->insn);
+    }
+    if (m->akind == A_MRSIO) {
+        emit(j, sl->insn);                          /* (the access check's syndrome) */
+        emit(j, (uint32_t)(uintptr_t)sl->ri);
+        emit(j, (uint32_t)((uint64_t)(uintptr_t)sl->ri >> 32));
     }
 }
 
@@ -2787,6 +2808,21 @@ IJSlowRet ishjit_slow_c(CPUARMState *env, uint64_t addr, const uint32_t *desc)
     uintptr_t ra = (uintptr_t)desc + (int32_t)desc[1];
     IJSlowRet r = { ra, desc[2] ? (uintptr_t)desc + (int32_t)desc[2] : 0 };
 
+    if (w & IJD_MRSIO) {
+        /* a counter's read, as helper_get_cp_reg64 (gt_*_access at EL0) */
+        const ARMCPRegInfo *ri =
+            (const void *)(uintptr_t)((uint64_t)desc[4] | (uint64_t)desc[5] << 32);
+        uint64_t v;
+
+        if (arm_current_el(env) == 0 && !extract32(env->cp15.c14_cntkctl, rt2, 1)) {
+            raise_exception_ra(env, EXCP_UDEF, desc[3], 1, ra);
+        }
+        v = helper_get_cp_reg64(env, ri);
+        if (rt != 31) {
+            env->xregs[rt] = v;
+        }
+        return r;
+    }
     if (w & IJD_ZVA) {
         /* as helper_dc_zva, with the TB's return address */
         int blocklen = 4 << env_archcpu(env)->dcz_blocksize;
@@ -3135,6 +3171,9 @@ static int ishjit_gen(CPUState *cs, TranslationBlock *tb, vaddr pc,
         }
         case K_MRS:
         case K_MRSCONST:
+            wr = (insn & 31) == 31 ? 0 : 1u << (insn & 31);
+            break;
+        case K_MRSIO:
             wr = (insn & 31) == 31 ? 0 : 1u << (insn & 31);
             break;
         case K_MSRDAIF:
@@ -3560,6 +3599,30 @@ static int ishjit_gen(CPUState *cs, TranslationBlock *tb, vaddr pc,
                         emit(j, i_str_x(tmp[r], H_ENV, xreg_off(r)));
                     }
                 }
+                break;
+            }
+            case K_MRSIO: {
+                IJSlow *sl = &slows[j->nslow];
+                int op2 = (insn >> 5) & 7;
+
+                memset(&sl->m, 0, sizeof(sl->m));
+                sl->m.akind = A_MRSIO;
+                sl->m.rt = insn & 31;
+                sl->m.rt2 = op2 == 2 || op2 == 6;       /* (timer index: virtual) */
+                sl->m.midx = j->mmu_idx;
+                sl->m.mode = M_IMM;
+                sl->ri = (const void *)(uintptr_t)ops[i].sysconst;
+                sl->insn = syn_aa64_sysregtrap(3, 3, op2, 14, 0, insn & 31, 1);
+                sl->allslow = true;             /* (always: a b to it) */
+                sl->flags = true;
+                sl->gkind = 0;
+                sl->cbnz2 = NULL;
+                sl->cbnz = j->ptr;
+                emit(j, 0);
+                sl->gslot = 0;
+                sl->ipc = ipc;
+                sl->resume = j->ptr;
+                j->nslow++;
                 break;
             }
             case K_DCZVA: {
