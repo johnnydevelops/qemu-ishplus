@@ -142,6 +142,7 @@ struct TranslationBlock {
     uint16_t ishjit_ras_id;         /* (its flags' id, ishjit.c ras_flag_id) */
     uint8_t ishjit_cont;            /* (calls go on in the TB itself) */
     uint8_t ishjit_link;            /* (bit n: jump n is patched as a bl) */
+    uint8_t ishjit_fwd;             /* (bit n: jump n goes forward, see ishjit.c) */
     int32_t ishjit_jmp2[TB_MAX_JMPS];   /* (cold code: after the TB, far) */
     int32_t ishjit_jmp2_reset[TB_MAX_JMPS];
     int32_t ishjit_reset[TB_MAX_JMPS];  /* (unchained: cold code, or 0) */

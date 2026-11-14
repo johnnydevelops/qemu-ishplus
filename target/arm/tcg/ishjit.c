@@ -1014,6 +1014,7 @@ static void emit_pcsync(IJ *j, vaddr target)
  * is set and the registers stored first, then the second patch point goes
  * to a TCG TB, or exits to cpu_exec.
  */
+static int fwd_on = -1;
 static void emit_goto_tb_link(IJ *j, vaddr dest, bool link)
 {
     int which;
@@ -1021,6 +1022,15 @@ static void emit_goto_tb_link(IJ *j, vaddr dest, bool link)
     emit_checkenv(j, 2);
     g_assert(j->nslot < TB_MAX_JMPS);
     which = j->nslot++;
+    /*
+     * A jump to a pc after this TB's first (in the same page) may skip
+     * the next TB's exit check (the 2 insns at its fast entry): a cycle
+     * of chained TBs needs a jump to a pc at or before its TB's first,
+     * and lookups go to the check, so every loop still goes through one
+     */
+    if (fwd_on && dest > j->pc_first) {
+        j->tb->ishjit_fwd |= 1 << which;
+    }
     if (link) {
         j->tb->ishjit_link |= 1 << which;
     }
@@ -4082,6 +4092,10 @@ static int ishjit_gen_code(CPUState *cs, TranslationBlock *tb, vaddr pc,
         tb->jmp_reset_offset[w] = TB_JMP_OFFSET_INVALID;
     }
     tb->ishjit_link = 0;
+    tb->ishjit_fwd = 0;
+    if (fwd_on < 0) {
+        fwd_on = !getenv("ISHJIT_NOFWD");
+    }
     if (!host_pc || !is_a64(env) || (pc & 3) ||
         !(cflags & CF_PCREL) ||
         (cflags & (CF_USE_ICOUNT | CF_NO_GOTO_TB | CF_NO_GOTO_PTR |

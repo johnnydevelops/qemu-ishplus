@@ -355,6 +355,7 @@ TranslationBlock *tb_gen_code(CPUState *cpu,
     tb->cflags = cflags;
     tb->ishjit_fast = 0;
     tb->ishjit_link = 0;
+    tb->ishjit_fwd = 0;
     for (int n = 0; n < TB_MAX_JMPS; n++) {
         tb->ishjit_jmp2[n] = 0;
         tb->ishjit_reset[n] = 0;

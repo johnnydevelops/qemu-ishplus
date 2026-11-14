@@ -657,8 +657,10 @@ static inline void tb_add_jump(TranslationBlock *tb, int n,
     if (tb->ishjit_fast && tb->ishjit_jmp2[n]) {
         /* iSH+: ishjit to ishjit with the registers in place, else stored */
         if (tb_next->ishjit_fast) {
+            /* (a forward jump skips the next TB's exit check: see ishjit.c) */
             tb_set_jmp_target(tb, n, (uintptr_t)tb_next->tc.ptr +
-                                     tb_next->ishjit_fast);
+                                     tb_next->ishjit_fast +
+                                     ((tb->ishjit_fwd >> n) & 1 ? 8 : 0));
         } else {
             ishjit_set_jmp2(tb, n, (uintptr_t)tb_next->tc.ptr);
         }
