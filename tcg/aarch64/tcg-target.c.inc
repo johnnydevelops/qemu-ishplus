@@ -2162,15 +2162,23 @@ void tb_target_set_jmp_target(const TranslationBlock *tb, int n,
     /* Either directly branch, or indirect branch load. */
     if (d_offset == sextract64(d_offset, 0, 28)) {
         insn = deposit32(I3206_B, 0, 26, d_offset >> 2);
+        if (tb->ishjit_link & (1 << n)) {
+            insn |= 1u << 31;               /* iSH+ ishjit: bl (a call) */
+        }
     } else {
         uintptr_t i_addr = (uintptr_t)tcg_splitwx_to_rx((void *)&tb->jmp_target_addr[n]);
         ptrdiff_t i_offset = i_addr - jmp_rx;
 
-        if (i_offset == sextract64(i_offset, 0, 21)) {
+        if (i_offset == sextract64(i_offset, 0, 21) && !(tb->ishjit_link & (1 << n))) {
             insn = deposit32(I3305_LDR | TCG_REG_TMP0, 5, 19, i_offset >> 2);
         } else {
             /* iSH+: (TB structs apart from code) unchained: the reset path */
-            insn = deposit32(I3206_B, 0, 26, 2);
+            ptrdiff_t r = (uintptr_t)tb->tc.ptr + tb->jmp_reset_offset[n] - jmp_rx;
+
+            insn = deposit32(I3206_B, 0, 26, r >> 2);
+            if (tb->ishjit_link & (1 << n)) {
+                insn |= 1u << 31;
+            }
         }
     }
     qatomic_set((uint32_t *)jmp_rw, insn);

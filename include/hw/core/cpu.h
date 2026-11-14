@@ -412,6 +412,12 @@ typedef struct CPUNegativeOffsetState {
 #endif
     IcountDecr icount_decr;
     bool can_do_io;
+    /*
+     * iSH+ ishjit: bumped whenever what a return-address stack entry
+     * assumes (the virtual-to-translated-code mapping of the jump cache)
+     * may have changed: entries made under another value are ignored
+     */
+    uint64_t ishjit_ras_gen;
 } CPUNegativeOffsetState;
 
 struct KVMState;

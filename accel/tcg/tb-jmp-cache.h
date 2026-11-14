@@ -55,6 +55,12 @@ static inline uint64_t tb_jmp_cache_stamp(CPUJumpCache *jc, vaddr pc)
     return qatomic_read(&jc->stamp[(int64_t)pc < 0]);
 }
 
+/* iSH+ ishjit: return-address stack entries made before are void */
+static inline void ishjit_ras_bump(CPUState *cpu)
+{
+    qatomic_inc(&cpu->neg.ishjit_ras_gen);
+}
+
 /* After a change of gen or tag (on the vCPU's thread, or with all stopped) */
 static inline void tb_jmp_cache_restamp(CPUJumpCache *jc)
 {

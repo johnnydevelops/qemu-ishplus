@@ -354,6 +354,7 @@ TranslationBlock *tb_gen_code(CPUState *cpu,
     tb->flags = flags;
     tb->cflags = cflags;
     tb->ishjit_fast = 0;
+    tb->ishjit_link = 0;
     tb->ishjit_jmp2[0] = tb->ishjit_jmp2[1] = 0;
     tb->ishplus_cover_lo = 0;       /* (set by the translator loop only) */
     tb_set_page_addr0(tb, phys_pc);
@@ -494,6 +495,13 @@ TranslationBlock *tb_gen_code(CPUState *cpu,
                 /* ISHJIT_PMAPCODE=hexpc: the code words of TBs at that guest pc */
                 const char *cpc = getenv("ISHJIT_PMAPCODE");
 
+                if (getenv("ISHJIT_PMAPG") && host_pc) {
+                    fprintf(pmap, "g %" PRIxPTR, (uintptr_t)tb->tc.ptr);
+                    for (int k = 0; k < tb->icount; k++) {
+                        fprintf(pmap, " %08x", ldl_le_p((uint8_t *)host_pc + 4 * k));
+                    }
+                    fputc('\n', pmap);
+                }
                 if (cpc && ((strtoull(cpc, NULL, 16) ^ (uint64_t)pc) & 0xfff) == 0 && !(pc >> 63)) {
                     fprintf(pmap, "C %" PRIxPTR, (uintptr_t)tb->tc.ptr);
                     for (int k = 0; k < gen_code_size / 4; k++) {
@@ -765,6 +773,7 @@ void tcg_flush_jmp_cache(CPUState *cpu)
     /* iSH+: a new generation empties every entry at once */
     qatomic_inc(&jc->gen);
     tb_jmp_cache_restamp(jc);
+    ishjit_ras_bump(cpu);
 }
 
 /*
@@ -780,6 +789,7 @@ void tcg_flush_jmp_cache_lower(CPUState *cpu)
         jc->lgen++;
         tb_jmp_cache_restamp(jc);
     }
+    ishjit_ras_bump(cpu);
 }
 
 /*
@@ -794,4 +804,5 @@ void tb_jmp_cache_set_tag(CPUState *cpu, uint32_t tag)
         jc->tag = tag;
         tb_jmp_cache_restamp(jc);
     }
+    ishjit_ras_bump(cpu);
 }

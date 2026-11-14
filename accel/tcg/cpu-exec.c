@@ -1095,6 +1095,7 @@ bool tcg_exec_realizefn(CPUState *cpu, Error **errp)
     cpu->tb_jmp_cache = g_new0(CPUJumpCache, 1);
     cpu->tb_jmp_cache->gen = 1;
     tb_jmp_cache_restamp(cpu->tb_jmp_cache);
+    cpu->neg.ishjit_ras_gen = 1;     /* (entries all 0: never valid) */
     tlb_init(cpu);
 #ifndef CONFIG_USER_ONLY
     tcg_iommu_init_notifier_list(cpu);

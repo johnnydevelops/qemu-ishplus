@@ -275,6 +275,13 @@ typedef struct CPUArchState {
      * base register in a TB: the base's host address, or 0 (softmmu way)
      */
     uint64_t ishjit_gslot[8];
+    /*
+     * iSH+ ishjit: return-address stack (ring): the top entry's byte
+     * offset, entries of { guest return address, host code to go on at,
+     * neg.ishjit_ras_gen when made, - }
+     */
+    uint64_t ishjit_ras_top;
+    uint64_t ishjit_ras[16][4];
     /* PSTATE isn't an architectural register for ARMv8. However, it is
      * convenient for us to assemble the underlying state into a 32 bit format
      * identical to the architectural format used for the SPSR. (This is also

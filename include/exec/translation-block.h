@@ -134,6 +134,7 @@ struct TranslationBlock {
      * registers are stored, and its unchained target.
      */
     uint16_t ishjit_fast;
+    uint8_t ishjit_link;            /* (bit n: jump n is patched as a bl) */
     int32_t ishjit_jmp2[2];         /* (cold code: after the TB, far) */
     int32_t ishjit_jmp2_reset[2];
 

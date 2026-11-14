@@ -63,21 +63,24 @@ void helper_msr_i_daifclear(CPUArchState *env, uint32_t imm);
 #define H_TMP1  17
 #define H_TMP2  27
 #define H_NONE  (-1)
-/* guest registers kept in env */
-#define ENV_HELD ((1u << 13) | (1u << 14) | (1u << 15) | (1u << 18) | \
-                  (1u << 27) | (1u << 28))
+/*
+ * guest registers kept in env (x17 too: host x30 is left free, so that
+ * guest calls can be host bl's, for the return-address stack)
+ */
+#define ENV_HELD ((1u << 13) | (1u << 14) | (1u << 15) | (1u << 17) | \
+                  (1u << 18) | (1u << 27) | (1u << 28))
 
 /* guest register (0-30, 31 = SP) -> host register, or H_NONE (in env) */
 static const int8_t g2h[32] = {
     0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12,
     H_NONE, H_NONE, H_NONE,             /* x13-x15 */
-    13, 14,                             /* x16, x17 */
+    13, H_NONE,                         /* x16, x17 */
     H_NONE,                             /* x18 */
     15,                                 /* x19 */
     20, 21, 22, 23, 24, 25, 26,         /* x20-x26 */
     H_NONE,                             /* x27 */
     H_NONE,                             /* x28 */
-    29, 30,                             /* x29, x30 */
+    29, 14,                             /* x29, x30 (host x30: bl's link) */
     28,                                 /* SP */
 };
 
@@ -139,6 +142,8 @@ typedef struct {
     bool in_cold;
     uint32_t *hot_save, *cptr;
     uint32_t *jmp2_c[2], *jmp2r_c[2];
+    uint32_t *link_reset_c;     /* (a bl's unchained way, its jump at the end) */
+    int ras_id;                 /* (ras_flag_id; -1: no return-address stack) */
 } IJ;
 
 #define IJ_COLD_MAX (64 * 1024 / 4)
@@ -734,11 +739,30 @@ static void *ishjit_emit_shared(void *code_ptr)
     emit(j, i_str_x(H_TMP0, H_ENV, offsetof(CPUARMState, pc)));
     emit(j, i_b(((uint32_t *)code_ptr + (ishjit_routine_rx[ISHJIT_R_SYNC] -
                   ishjit_routine_rx[ISHJIT_R_LOAD]) / 4) - j->ptr));
+    if (ishjit_pmap_get()) {
+        static const char *nm[] = { "R_LOAD", "R_SYNC", "R_SLOW", "", "R_LOOKUP", "R_PCSYNC" };
+
+        for (int r = 0; r < 6; r++) {
+            if (r != ISHJIT_R_SCRATCH) {
+                fprintf(ishjit_pmap_get(), "S %" PRIx64 " %s\n", ishjit_routine_rx[r], nm[r]);
+            }
+        }
+        fprintf(ishjit_pmap_get(), "S %" PRIxPTR " end\n", (uintptr_t)tcg_splitwx_to_rx(j->ptr));
+        fprintf(ishjit_pmap_get(), "C %" PRIx64, ishjit_routine_rx[ISHJIT_R_LOOKUP]);
+        for (uint32_t *w = (uint32_t *)code_ptr + (ishjit_routine_rx[ISHJIT_R_LOOKUP] -
+                                                   ishjit_routine_rx[ISHJIT_R_LOAD]) / 4;
+             w < j->ptr; w++) {
+            fprintf(ishjit_pmap_get(), " %08x", *w);
+        }
+        fprintf(ishjit_pmap_get(), "\nG\n");
+    }
     return j->ptr;
 }
 
+static QemuMutex ras_flag_lock;
 static void __attribute__((constructor)) ishjit_register(void)
 {
+    qemu_mutex_init(&ras_flag_lock);
     tcg_extra_prologue_hook = ishjit_emit_shared;
 }
 
@@ -942,10 +966,14 @@ static void emit_pcsync(IJ *j, vaddr target)
 static void emit_goto_tb(IJ *j, int which, vaddr dest)
 {
     emit_checkenv(j, 2);
+    bool link = (j->tb->ishjit_link >> which) & 1;
+
     j->tb->jmp_insn_offset[which] = ij_offset(j);
-    emit(j, 0x14000000);                    /* b . (patched) */
-    emit(j, i_br(H_TMP0));                  /* (when patched to ldr x16) */
-    j->tb->jmp_reset_offset[which] = ij_offset(j);
+    emit(j, 0x14000000);                    /* b . (patched; bl when link) */
+    if (!link) {
+        emit(j, i_br(H_TMP0));              /* (when patched to ldr x16) */
+        j->tb->jmp_reset_offset[which] = ij_offset(j);
+    }
     {
         /* (the unchained way: cold) */
         uint32_t *c;
@@ -958,7 +986,15 @@ static void emit_goto_tb(IJ *j, int which, vaddr dest)
         j->jmp2r_c[which] = j->ptr;
         emit_exit_tb(j, which);
         ij_to_hot(j);
-        emit_b_cold(j, c);
+        if (link) {
+            /*
+             * (a call: the landing right after the bl, its return address;
+             * the unchained target's jump at the hot code's end)
+             */
+            j->link_reset_c = c;
+        } else {
+            emit_b_cold(j, c);
+        }
     }
 }
 
@@ -1002,20 +1038,27 @@ static void emit_ld_env_neg(IJ *j, int rt, int off)
  */
 static int lookup_shared = -1;
 static void emit_lookup_body(IJ *j, bool shared);
-static void emit_lookup(IJ *j)
+static bool ras_on;
+static void emit_lookup_link(IJ *j, bool link)
 {
     intptr_t o0 = ij_offset(j);
 
-    if (lookup_shared) {
+    if (lookup_shared || link) {
         /* the shared routine R_LOOKUP, x27 = this TB (its flags) */
         emit_checkenv(j, 3);
         emit_vstore(j, j->vwritten);
         emit_tb_addr(j, H_TMP2, 0);
-        emit_jump_routine(j, ISHJIT_R_LOOKUP, H_TMP1);
+        emit_env_far(j, true, H_TMP1, H_TMP1, routine_off(ISHJIT_R_LOOKUP));
+        emit(j, link ? i_blr(H_TMP1) : i_br(H_TMP1));
     } else {
         emit_lookup_body(j, false);
     }
     ij_region(j, o0, 'L');
+}
+
+static void emit_lookup(IJ *j)
+{
+    emit_lookup_link(j, false);
 }
 
 /*
@@ -1125,6 +1168,131 @@ static void emit_lookup_body(IJ *j, bool shared)
     emit_movi(j, H_TMP0, (uintptr_t)helper_lookup_tb_ptr);
     emit(j, i_blr(H_TMP0));
     emit(j, i_br(0));
+}
+
+/*
+ * Return-address stack: a guest call (bl, blr) pushes { return address,
+ * where the host code goes on after it, the generation } on a ring in env
+ * and is a host bl/blr (so the host's own return predictor learns it); a
+ * guest ret to the top entry's address (same generation) pops it and is a
+ * host ret there. That code (the "landing", right after the call) goes on
+ * to the return address's TB. Anything else (ring overwritten, another
+ * mapping, longjmp...) takes the lookup.
+ */
+static unsigned ras_base(void)
+{
+    return offsetof(CPUARMState, ishjit_ras);
+}
+
+static int ras_gen_off(void)
+{
+    return (int)offsetof(ArchCPU, parent_obj.neg.ishjit_ras_gen) -
+           (int)offsetof(ArchCPU, env);
+}
+
+/*
+ * A small number for each set of TB flags (flags, cflags, cs_base) seen: a
+ * return-address stack entry holds its caller TB's, and is only taken by a
+ * ret in a TB of the same flags (as the lookup's comparison)
+ */
+static uint64_t ras_flag_set[1 << 12][2];
+static int ras_nflags;
+
+static int ras_flag_id(TranslationBlock *tb)
+{
+    uint64_t f = (uint64_t)(tb_cflags(tb) & ~CF_INVALID) << 32 | tb->flags;
+    int id = -1;
+
+    qemu_mutex_lock(&ras_flag_lock);
+    for (int k = 0; k < ras_nflags; k++) {
+        if (ras_flag_set[k][0] == f && ras_flag_set[k][1] == tb->cs_base) {
+            id = k;
+            break;
+        }
+    }
+    if (id < 0 && ras_nflags < ARRAY_SIZE(ras_flag_set)) {
+        id = ras_nflags++;
+        ras_flag_set[id][0] = f;
+        ras_flag_set[id][1] = tb->cs_base;
+    }
+    qemu_mutex_unlock(&ras_flag_lock);
+    return id;                                  /* (-1: too many, no RAS) */
+}
+
+/* @rd = gen << 20 | this TB's flag id: what an entry made here holds */
+static void emit_ras_tag(IJ *j, int rd)
+{
+    emit(j, 0xF8400000 | (ras_gen_off() & 0x1ff) << 12 | H_ENV << 5 | rd);  /* ldur rd, gen */
+    emit(j, 0xD36CAC00 | rd << 5 | rd);                                 /* lsl rd, rd, #20 */
+    emit_addi(j, rd, rd, j->ras_id);
+}
+
+/* push { guest x30 (host @rret), landing (adr patched in *@adr), tag }: x27, x17 */
+static void emit_ras_push(IJ *j, int rret, uint32_t **adr)
+{
+    QEMU_BUILD_BUG_ON(sizeof(((CPUARMState *)0)->ishjit_ras) != 512);
+    QEMU_BUILD_BUG_ON(offsetof(CPUARMState, ishjit_ras_top) > 32760);
+    g_assert(ras_gen_off() >= -256 && ras_gen_off() % 8 == 0);
+    emit(j, i_ldr_x(H_TMP2, H_ENV, offsetof(CPUARMState, ishjit_ras_top)));
+    emit(j, 0x91008000 | H_TMP2 << 5 | H_TMP2);                     /* add x27, x27, #32 */
+    emit(j, 0x927B0F60 | H_TMP2 << 5 | H_TMP2 | (0x0 << 10));       /* and x27, x27, #0x1e0 */
+    emit(j, i_str_x(H_TMP2, H_ENV, offsetof(CPUARMState, ishjit_ras_top)));
+    emit(j, 0x8B000000 | H_ENV << 16 | H_TMP2 << 5 | H_TMP2);       /* add x27, x27, env */
+    emit_addi(j, H_TMP2, H_TMP2, ras_base());
+    *adr = j->ptr;
+    emit(j, 0);                                                     /* adr x17, landing */
+    emit(j, 0xA9000000 | H_TMP1 << 10 | H_TMP2 << 5 | rret);        /* stp xret, x17, [x27] */
+    emit_ras_tag(j, H_TMP1);
+    emit(j, i_str_x(H_TMP1, H_TMP2, 16));
+}
+
+/* the landing after a call: on to @ret (guest pc in env: the ret stored it) */
+static void emit_landing(IJ *j, uint32_t *adr, vaddr ret)
+{
+    uint32_t vw = j->vwritten;
+
+    *adr = i_adr(H_TMP1, (j->ptr - adr) * 4);
+    /* (the V registers are in env: the callee's code stored them) */
+    j->vwritten = 0;
+    if (((ret ^ j->pc_first) & TARGET_PAGE_MASK) == 0) {
+        emit_goto_tb(j, 1, ret);
+    } else {
+        emit(j, i_ldr_x(H_TMP0, H_ENV, offsetof(CPUARMState, pc)));
+        emit_lookup(j);
+    }
+    j->vwritten = vw;
+}
+
+/* a guest ret to the value of host @src (x16 the target from here on) */
+static void emit_ret(IJ *j, int src)
+{
+    uint32_t *miss, *miss2;
+
+    emit(j, i_mov_x(H_TMP0, src));
+    emit(j, i_str_x(H_TMP0, H_ENV, offsetof(CPUARMState, pc)));
+    emit(j, i_ldr_x(H_TMP1, H_ENV, offsetof(CPUARMState, ishjit_ras_top)));
+    emit(j, 0x8B000000 | H_TMP1 << 16 | H_ENV << 5 | H_TMP2);       /* add x27, env, x17 */
+    emit_addi(j, H_TMP2, H_TMP2, ras_base());
+    emit(j, i_ldr_x(H_TMP1, H_TMP2, 0));
+    emit(j, 0xCA000000 | H_TMP0 << 16 | H_TMP1 << 5 | H_TMP1);      /* eor x17, x17, x16 */
+    miss = j->ptr;
+    emit(j, 0);                                                     /* cbnz x17, miss */
+    emit(j, i_ldr_x(H_TMP1, H_TMP2, 16));
+    emit_ras_tag(j, H_TMP0);
+    emit(j, 0xCA000000 | H_TMP0 << 16 | H_TMP1 << 5 | H_TMP1);      /* eor x17, x17, x16 */
+    miss2 = j->ptr;
+    emit(j, 0);                                                     /* cbnz x17, miss2 */
+    emit(j, i_ldr_x(H_TMP1, H_TMP2, 8));                           /* the landing */
+    emit(j, 0xCB000000 | H_ENV << 16 | H_TMP2 << 5 | H_TMP2);       /* sub x27, x27, env */
+    emit_addi(j, H_TMP2, H_TMP2, -(int64_t)(ras_base() + 32));
+    emit(j, 0x927B0F60 | H_TMP2 << 5 | H_TMP2);                     /* and x27, x27, #0x1e0 */
+    emit(j, i_str_x(H_TMP2, H_ENV, offsetof(CPUARMState, ishjit_ras_top)));
+    emit_vstore(j, j->vwritten);
+    emit(j, 0xD65F0000 | H_TMP1 << 5);                              /* ret x17 */
+    *miss2 = 0xB5000000 | ((j->ptr - miss2) & 0x7ffff) << 5 | H_TMP1;
+    emit(j, i_ldr_x(H_TMP0, H_ENV, offsetof(CPUARMState, pc)));
+    *miss = 0xB5000000 | ((j->ptr - miss) & 0x7ffff) << 5 | H_TMP1;
+    emit_lookup(j);
 }
 
 /* To @dest: pc updated, then chained, or looked up */
@@ -2664,7 +2832,9 @@ static int ishjit_gen(CPUState *cs, TranslationBlock *tb, vaddr pc,
     g_assert(j->page_bits == shared_page_bits && TARGET_PAGE_BITS <= 16);
     if (lookup_shared < 0) {
         lookup_shared = !getenv("ISHJIT_INLINE_LOOKUP");
+        ras_on = !getenv("ISHJIT_NORAS");
     }
+    j->ras_id = ras_on ? ras_flag_id(tb) : -1;
     j->el = arm_current_el(env);
     j->fp_ok = EX_TBFLAG_ANY(tbf, FPEXC_EL) == 0;
     j->fp_default = EX_TBFLAG_A64(tbf, FPDEFAULT);
@@ -3162,12 +3332,29 @@ static int ishjit_gen(CPUState *cs, TranslationBlock *tb, vaddr pc,
             case K_BL:
             case K_B: {
                 vaddr dest = ipc + (sextract64(insn, 0, 26) << 2);
+                uint32_t *adr = NULL;
 
                 if (kinds[i] == K_BL) {
                     emit_pc_rel(j, g2h[30], ipc + 4);
+                    if (j->ras_id >= 0) {
+                        emit_ras_push(j, g2h[30], &adr);
+                    }
                 }
                 end_off[i] = ij_offset(j);
-                emit_jump(j, 0, dest);
+                if (adr) {
+                    /* a host call: bl (chained) or blr to the lookup */
+                    if (((dest ^ j->pc_first) & TARGET_PAGE_MASK) == 0) {
+                        emit_vstore(j, j->vwritten);
+                        j->tb->ishjit_link |= 1;
+                        emit_goto_tb(j, 0, dest);
+                    } else {
+                        emit_pc_rel(j, H_TMP0, dest);
+                        emit_lookup_link(j, true);
+                    }
+                    emit_landing(j, adr, ipc + 4);
+                } else {
+                    emit_jump(j, 0, dest);
+                }
                 break;
             }
             case K_BCOND:
@@ -3206,9 +3393,23 @@ static int ishjit_gen(CPUState *cs, TranslationBlock *tb, vaddr pc,
                 int g = (insn >> 5) & 31;
                 int src = branch_src(j, g);
 
+                if (j->ras_id >= 0 && ((insn >> 21) & 3) == 2) {   /* ret */
+                    end_off[i] = ij_offset(j);
+                    emit_ret(j, src);
+                    break;
+                }
                 emit(j, i_mov_x(H_TMP0, src));
                 if (((insn >> 21) & 3) == 1) {          /* blr */
                     emit_pc_rel(j, g2h[30], ipc + 4);
+                    if (j->ras_id >= 0) {
+                        uint32_t *adr;
+
+                        emit_ras_push(j, g2h[30], &adr);
+                        end_off[i] = ij_offset(j);
+                        emit_lookup_link(j, true);
+                        emit_landing(j, adr, ipc + 4);
+                        break;
+                    }
                 }
                 end_off[i] = ij_offset(j);
                 emit_lookup(j);                 /* (target in x16) */
@@ -3281,6 +3482,11 @@ static int ishjit_gen(CPUState *cs, TranslationBlock *tb, vaddr pc,
                     }
                 }
             }
+        }
+
+        if (j->link_reset_c) {
+            tb->jmp_reset_offset[0] = ij_offset(j);
+            emit_b_cold(j, j->link_reset_c);
         }
 
         /* The pending-exit check's target (cold): nothing is live yet */
@@ -3385,6 +3591,15 @@ static int ishjit_gen(CPUState *cs, TranslationBlock *tb, vaddr pc,
 #undef COLD
         tcg_ctx->code_gen_tbtop = cold;
         tcg_ctx->code_gen_highwater = cold - IJ_HIGHWATER;
+        if (ishjit_pmap_get()) {
+            FILE *f = ishjit_pmap_get();
+
+            flockfile(f);
+            fprintf(f, "K %" PRIxPTR " %zx %" PRIxPTR "\n",
+                    (uintptr_t)tcg_splitwx_to_rx(cold), cbytes,
+                    (uintptr_t)tcg_splitwx_to_rx(j->start));
+            funlockfile(f);
+        }
         flush_idcache_range((uintptr_t)tcg_splitwx_to_rx(cold), (uintptr_t)cold, cbytes);
     }
     tb->size = 4 * n;
