@@ -280,8 +280,7 @@ typedef struct CPUArchState {
      * offset, entries of { guest return address, host code to go on at,
      * neg.ishjit_ras_gen when made, - }
      */
-    uint64_t ishjit_ras_top;
-    uint64_t ishjit_ras[16][4];
+    uint64_t ishjit_ras_top;        /* (the top entry's address, in ishjit_ras_alloc) */
     /*
      * iSH+ ishjit: the jump target cache (a table of { guest pc, tag as a
      * return-address stack entry's, fast entry }), and scratch for it
@@ -794,6 +793,7 @@ typedef struct CPUArchState {
     /* iSH+ ishjit: the shared routines' (RX) addresses (ishjit.c, ISHJIT_R_*) */
     uint64_t ishjit_routine[8];
     void *ishjit_ic_alloc;          /* (env->ishjit_ic after a reset) */
+    void *ishjit_ras_alloc;         /* (the return-address stack: 16 entries, 512-aligned) */
 
     /* Fields after this point are preserved across CPU reset. */
 

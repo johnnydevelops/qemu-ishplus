@@ -20,6 +20,7 @@
 #include "qemu/osdep.h"
 #include "qemu/log.h"
 #include "qemu/cacheflush.h"
+#include "qemu/memalign.h"
 #include "qemu/main-loop.h"
 #include "accel/tcg/cpu-ops.h"
 #include "cpu.h"
@@ -1304,10 +1305,6 @@ static void emit_lookup_body(IJ *j, bool shared)
  * to the return address's TB. Anything else (ring overwritten, another
  * mapping, longjmp...) takes the lookup.
  */
-static unsigned ras_base(void)
-{
-    return offsetof(CPUARMState, ishjit_ras);
-}
 
 static int ras_gen_off(void)
 {
@@ -1353,22 +1350,23 @@ static void emit_ras_tag(IJ *j, int rd)
     emit_addi(j, rd, rd, j->ras_id);
 }
 
-/* push { guest x30 (host @rret), landing (adr patched in *@adr), tag }: x27, x17 */
+/*
+ * push { guest x30 (host @rret), tag, landing (adr patched in *@adr) } on
+ * the ring (512 bytes, 512-aligned: the top's address wraps with a bfxil)
+ * (x27, x17)
+ */
 static void emit_ras_push(IJ *j, int rret, uint32_t **adr)
 {
-    QEMU_BUILD_BUG_ON(sizeof(((CPUARMState *)0)->ishjit_ras) != 512);
     QEMU_BUILD_BUG_ON(offsetof(CPUARMState, ishjit_ras_top) > 32760);
     g_assert(ras_gen_off() >= -256 && ras_gen_off() + 8 < 0 && ras_gen_off() % 8 == 0);
     emit(j, i_ldr_x(H_TMP2, H_ENV, offsetof(CPUARMState, ishjit_ras_top)));
-    emit(j, 0x91008000 | H_TMP2 << 5 | H_TMP2);                     /* add x27, x27, #32 */
-    emit(j, 0x927B0F60 | H_TMP2 << 5 | H_TMP2 | (0x0 << 10));       /* and x27, x27, #0x1e0 */
+    emit(j, 0x91008000 | H_TMP2 << 5 | H_TMP1);                     /* add x17, x27, #32 */
+    emit(j, 0xB3400000 | 8 << 10 | H_TMP1 << 5 | H_TMP2);           /* bfxil x27, x17, #0, #9 */
     emit(j, i_str_x(H_TMP2, H_ENV, offsetof(CPUARMState, ishjit_ras_top)));
-    emit(j, 0x8B000000 | H_ENV << 16 | H_TMP2 << 5 | H_TMP2);       /* add x27, x27, env */
-    emit_addi(j, H_TMP2, H_TMP2, ras_base());
+    emit_ras_tag(j, H_TMP1);
+    emit(j, 0xA9000000 | H_TMP1 << 10 | H_TMP2 << 5 | rret);        /* stp xret, x17, [x27] */
     *adr = j->ptr;
     emit(j, 0);                                                     /* adr x17, landing */
-    emit(j, 0xA9000000 | H_TMP1 << 10 | H_TMP2 << 5 | rret);        /* stp xret, x17, [x27] */
-    emit_ras_tag(j, H_TMP1);
     emit(j, i_str_x(H_TMP1, H_TMP2, 16));
 }
 
@@ -1405,29 +1403,41 @@ static void emit_ret(IJ *j, int src)
 
     emit(j, i_mov_x(H_TMP0, src));
     emit(j, i_str_x(H_TMP0, H_ENV, offsetof(CPUARMState, pc)));
-    emit(j, i_ldr_x(H_TMP1, H_ENV, offsetof(CPUARMState, ishjit_ras_top)));
-    emit(j, 0x8B000000 | H_TMP1 << 16 | H_ENV << 5 | H_TMP2);       /* add x27, env, x17 */
-    emit_addi(j, H_TMP2, H_TMP2, ras_base());
+    emit(j, i_ldr_x(H_TMP2, H_ENV, offsetof(CPUARMState, ishjit_ras_top)));
     emit(j, i_ldr_x(H_TMP1, H_TMP2, 0));
     emit(j, 0xCA000000 | H_TMP0 << 16 | H_TMP1 << 5 | H_TMP1);      /* eor x17, x17, x16 */
     miss = j->ptr;
     emit(j, 0);                                                     /* cbnz x17, miss */
-    emit(j, i_ldr_x(H_TMP1, H_TMP2, 16));
+    emit(j, i_ldr_x(H_TMP1, H_TMP2, 8));
     emit_ras_tag(j, H_TMP0);
     emit(j, 0xCA000000 | H_TMP0 << 16 | H_TMP1 << 5 | H_TMP1);      /* eor x17, x17, x16 */
     miss2 = j->ptr;
-    emit(j, 0);                                                     /* cbnz x17, miss2 */
-    emit(j, i_ldr_x(H_TMP1, H_TMP2, 8));                           /* the landing */
-    emit(j, 0xCB000000 | H_ENV << 16 | H_TMP2 << 5 | H_TMP2);       /* sub x27, x27, env */
-    emit_addi(j, H_TMP2, H_TMP2, -(int64_t)(ras_base() + 32));
-    emit(j, 0x927B0F60 | H_TMP2 << 5 | H_TMP2);                     /* and x27, x27, #0x1e0 */
+    emit(j, 0);                                                     /* cbnz x17, miss */
+    emit(j, i_ldr_x(H_TMP1, H_TMP2, 16));                          /* the landing */
+    emit(j, 0xD1008000 | H_TMP2 << 5 | H_TMP0);                     /* sub x16, x27, #32 */
+    emit(j, 0xB3400000 | 8 << 10 | H_TMP0 << 5 | H_TMP2);           /* bfxil x27, x16, #0, #9 */
     emit(j, i_str_x(H_TMP2, H_ENV, offsetof(CPUARMState, ishjit_ras_top)));
     emit_vstore(j, j->vwritten);
     emit(j, 0xD65F0000 | H_TMP1 << 5);                              /* ret x17 */
-    *miss2 = 0xB5000000 | ((j->ptr - miss2) & 0x7ffff) << 5 | H_TMP1;
-    emit(j, i_ldr_x(H_TMP0, H_ENV, offsetof(CPUARMState, pc)));
-    *miss = 0xB5000000 | ((j->ptr - miss) & 0x7ffff) << 5 | H_TMP1;
-    emit_lookup(j);
+    /* a miss (cold): R_LOOKUP to env->pc */
+    {
+        uint32_t *c;
+
+        ij_to_cold(j);
+        c = j->ptr;
+        emit_vstore(j, j->vwritten);
+        emit(j, i_ldr_x(H_TMP0, H_ENV, offsetof(CPUARMState, pc)));
+        emit_tb_addr(j, H_TMP2, 0);
+        emit_jump_routine(j, ISHJIT_R_LOOKUP, H_TMP1);
+        ij_to_hot(j);
+        g_assert(j->ntramp + 2 <= ARRAY_SIZE(j->tramp_at));
+        j->tramp_at[j->ntramp] = miss;
+        j->tramp_insn[j->ntramp] = 0xB5000000 | H_TMP1;            /* cbnz x17 */
+        j->tramp_cold[j->ntramp++] = c;
+        j->tramp_at[j->ntramp] = miss2;
+        j->tramp_insn[j->ntramp] = 0xB5000000 | H_TMP1;
+        j->tramp_cold[j->ntramp++] = c;
+    }
 }
 
 /* To @dest: pc updated, then chained, or looked up */
@@ -4157,6 +4167,11 @@ void ishjit_env_reset(void *envp)
         env->ishjit_ic_alloc = g_malloc0(32 << IC_BITS);
     }
     env->ishjit_ic = (uintptr_t)env->ishjit_ic_alloc;
+    if (!env->ishjit_ras_alloc) {
+        env->ishjit_ras_alloc = qemu_memalign(512, 512);
+        memset(env->ishjit_ras_alloc, 0, 512);
+    }
+    env->ishjit_ras_top = (uintptr_t)env->ishjit_ras_alloc;
     env_cpu(env)->ishjit_icmap = env->ishjit_icmap;
     /* (the map is empty now: the cache's entries made before are void) */
     qatomic_add(&env_cpu(env)->neg.ishjit_ras_gen[0], 1 << 20);
