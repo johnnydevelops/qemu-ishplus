@@ -417,7 +417,7 @@ typedef struct CPUNegativeOffsetState {
      * assumes (the virtual-to-translated-code mapping of the jump cache)
      * may have changed: entries made under another value are ignored
      */
-    uint64_t ishjit_ras_gen;
+    uint64_t ishjit_ras_gen[2];     /* (lower, upper half; in units of 1 << 20) */
 } CPUNegativeOffsetState;
 
 struct KVMState;
@@ -556,6 +556,13 @@ struct CPUState {
     MemoryRegion *memory;
 
     struct CPUJumpCache *tb_jmp_cache;
+    /*
+     * iSH+ ishjit: a byte per (hash of a) TB its jump target cache may
+     * hold, set by the cache's fills, emptied with each generation (NULL
+     * without ishjit). ISHJIT_ICMAP_N bytes.
+     */
+    uint8_t *ishjit_icmap;
+#define ISHJIT_ICMAP_N 1024
 
     GArray *gdb_regs;
     int gdb_num_regs;

@@ -56,9 +56,30 @@ static inline uint64_t tb_jmp_cache_stamp(CPUJumpCache *jc, vaddr pc)
 }
 
 /* iSH+ ishjit: return-address stack entries made before are void */
+/*
+ * (two: for code in the lower half of the address space, a process's, and
+ * the upper, the kernel's; in units of 1 << 20: entries hold it plus a TB
+ * flags id)
+ */
+static inline void ishjit_ras_bump_remote(CPUState *cpu)
+{
+    qatomic_add(&cpu->neg.ishjit_ras_gen[0], 1 << 20);
+    qatomic_add(&cpu->neg.ishjit_ras_gen[1], 1 << 20);
+}
+
+/* (on the vCPU's thread, or with all stopped) */
 static inline void ishjit_ras_bump(CPUState *cpu)
 {
-    qatomic_inc(&cpu->neg.ishjit_ras_gen);
+    if (cpu->ishjit_icmap) {
+        memset(cpu->ishjit_icmap, 0, ISHJIT_ICMAP_N);
+    }
+    ishjit_ras_bump_remote(cpu);
+}
+
+/* only the entries for the lower (process) or upper half */
+static inline void ishjit_ras_bump_half(CPUState *cpu, bool upper)
+{
+    qatomic_add(&cpu->neg.ishjit_ras_gen[upper], 1 << 20);
 }
 
 /* After a change of gen or tag (on the vCPU's thread, or with all stopped) */

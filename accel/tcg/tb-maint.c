@@ -42,9 +42,9 @@
 
 /* List iterators for lists of tagged pointers in TranslationBlock. */
 #define TB_FOR_EACH_TAGGED(head, tb, n, field)                          \
-    for (n = (head) & 1, tb = (TranslationBlock *)((head) & ~1);        \
-         tb; tb = (TranslationBlock *)tb->field[n], n = (uintptr_t)tb & 1, \
-             tb = (TranslationBlock *)((uintptr_t)tb & ~1))
+    for (n = (head) & 7, tb = (TranslationBlock *)((head) & ~7);        \
+         tb; tb = (TranslationBlock *)tb->field[n], n = (uintptr_t)tb & 7, \
+             tb = (TranslationBlock *)((uintptr_t)tb & ~7))
 
 #define TB_FOR_EACH_JMP(head_tb, tb, n)                                 \
     TB_FOR_EACH_TAGGED((head_tb)->jmp_list_head, tb, n, jmp_list_next)
@@ -872,6 +872,10 @@ static inline void tb_remove_from_jmp_list(TranslationBlock *orig, int n_orig)
 void tb_reset_jump(TranslationBlock *tb, int n)
 {
     uintptr_t addr = (uintptr_t)(tb->tc.ptr + tb->jmp_reset_offset[n]);
+
+    if (tb->ishjit_fast && tb->ishjit_reset[n]) {
+        addr = (uintptr_t)tb->tc.ptr + tb->ishjit_reset[n];
+    }
     tb_set_jmp_target(tb, n, addr);
     if (tb->ishjit_fast && tb->ishjit_jmp2[n]) {
         ishjit_set_jmp2(tb, n, (uintptr_t)tb->tc.ptr + tb->ishjit_jmp2_reset[n]);
@@ -915,6 +919,13 @@ static inline void tb_jmp_unlink(TranslationBlock *dest)
     qemu_spin_unlock(&dest->jmp_lock);
 }
 
+/* iSH+ debugging (ISHJIT_STATS=1) */
+static void tb_inval_count_dump(void)
+{
+    fprintf(stderr, "ISHJIT TB invalidations %u\n",
+            (unsigned)qatomic_read(&tb_ctx.tb_phys_invalidate_count));
+}
+
 static void tb_jmp_cache_inval_tb(TranslationBlock *tb)
 {
     CPUState *cpu;
@@ -927,6 +938,21 @@ static void tb_jmp_cache_inval_tb(TranslationBlock *tb)
          * empties the caches). Emptying every vCPU's cache at each
          * invalidation made them miss most of the time.
          */
+        if (tb->ishjit_fast) {
+            /*
+             * ishjit: return-address stack entries going on in the TB's
+             * own code (calls in superblocks), jump target cache entries
+             * that may hold it: void
+             */
+            unsigned h = ((uintptr_t)tb >> 6) & (ISHJIT_ICMAP_N - 1);
+
+            CPU_FOREACH(cpu) {
+                if (tb->ishjit_cont ||
+                    (cpu->ishjit_icmap && qatomic_read(&cpu->ishjit_icmap[h]))) {
+                    ishjit_ras_bump_remote(cpu);
+                }
+            }
+        }
     } else {
         uint32_t h = tb_jmp_cache_hash_func(tb->pc);
 
@@ -974,14 +1000,23 @@ static void do_tb_phys_invalidate(TranslationBlock *tb, bool rm_from_page_list)
         tb_jmp_cache_inval_tb(tb);
 
         /* suppress this TB from the two jump lists */
-        tb_remove_from_jmp_list(tb, 0);
-        tb_remove_from_jmp_list(tb, 1);
+        for (int n = 0; n < TB_MAX_JMPS; n++) {
+            tb_remove_from_jmp_list(tb, n);
+        }
 
         /* suppress any remaining jumps to this TB */
         tb_jmp_unlink(tb);
 
         qatomic_set(&tb_ctx.tb_phys_invalidate_count,
                     tb_ctx.tb_phys_invalidate_count + 1);
+        {
+            static bool once;
+
+            if (!once && getenv("ISHJIT_STATS")) {
+                once = true;
+                atexit(tb_inval_count_dump);
+            }
+        }
     }
 
     qemu_thread_jit_execute();

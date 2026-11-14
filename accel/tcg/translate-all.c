@@ -355,7 +355,12 @@ TranslationBlock *tb_gen_code(CPUState *cpu,
     tb->cflags = cflags;
     tb->ishjit_fast = 0;
     tb->ishjit_link = 0;
-    tb->ishjit_jmp2[0] = tb->ishjit_jmp2[1] = 0;
+    for (int n = 0; n < TB_MAX_JMPS; n++) {
+        tb->ishjit_jmp2[n] = 0;
+        tb->ishjit_reset[n] = 0;
+        tb->jmp_reset_offset[n] = TB_JMP_OFFSET_INVALID;
+        tb->jmp_insn_offset[n] = TB_JMP_OFFSET_INVALID;
+    }
     tb->ishplus_cover_lo = 0;       /* (set by the translator loop only) */
     tb_set_page_addr0(tb, phys_pc);
     tb_set_page_addr1(tb, -1);
@@ -598,17 +603,16 @@ TranslationBlock *tb_gen_code(CPUState *cpu,
     /* init jump list */
     qemu_spin_init(&tb->jmp_lock);
     tb->jmp_list_head = (uintptr_t)NULL;
-    tb->jmp_list_next[0] = (uintptr_t)NULL;
-    tb->jmp_list_next[1] = (uintptr_t)NULL;
-    tb->jmp_dest[0] = (uintptr_t)NULL;
-    tb->jmp_dest[1] = (uintptr_t)NULL;
+    for (int n = 0; n < TB_MAX_JMPS; n++) {
+        tb->jmp_list_next[n] = (uintptr_t)NULL;
+        tb->jmp_dest[n] = (uintptr_t)NULL;
+    }
 
     /* init original jump addresses which have been set during tcg_gen_code() */
-    if (tb->jmp_reset_offset[0] != TB_JMP_OFFSET_INVALID) {
-        tb_reset_jump(tb, 0);
-    }
-    if (tb->jmp_reset_offset[1] != TB_JMP_OFFSET_INVALID) {
-        tb_reset_jump(tb, 1);
+    for (int n = 0; n < TB_MAX_JMPS; n++) {
+        if (tb->jmp_reset_offset[n] != TB_JMP_OFFSET_INVALID) {
+            tb_reset_jump(tb, n);
+        }
     }
 
     /*
@@ -789,7 +793,7 @@ void tcg_flush_jmp_cache_lower(CPUState *cpu)
         jc->lgen++;
         tb_jmp_cache_restamp(jc);
     }
-    ishjit_ras_bump(cpu);
+    ishjit_ras_bump_half(cpu, false);
 }
 
 /*
@@ -804,5 +808,5 @@ void tb_jmp_cache_set_tag(CPUState *cpu, uint32_t tag)
         jc->tag = tag;
         tb_jmp_cache_restamp(jc);
     }
-    ishjit_ras_bump(cpu);
+    ishjit_ras_bump_half(cpu, false);
 }

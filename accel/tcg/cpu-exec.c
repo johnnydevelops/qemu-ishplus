@@ -468,7 +468,7 @@ cpu_tb_exec(CPUState *cpu, TranslationBlock *itb, int *tb_exit)
 
     trace_exec_tb_exit(last_tb, *tb_exit);
 
-    if (*tb_exit > TB_EXIT_IDX1) {
+    if (*tb_exit > TB_EXIT_IDXMAX) {
         /* We didn't start executing this TB (eg because the instruction
          * counter hit zero); we must restore the guest PC to the address
          * of the start of the TB.
@@ -1095,7 +1095,8 @@ bool tcg_exec_realizefn(CPUState *cpu, Error **errp)
     cpu->tb_jmp_cache = g_new0(CPUJumpCache, 1);
     cpu->tb_jmp_cache->gen = 1;
     tb_jmp_cache_restamp(cpu->tb_jmp_cache);
-    cpu->neg.ishjit_ras_gen = 1;     /* (entries all 0: never valid) */
+    cpu->neg.ishjit_ras_gen[0] = 1 << 20;  /* (entries all 0: never valid) */
+    cpu->neg.ishjit_ras_gen[1] = 1 << 20;
     tlb_init(cpu);
 #ifndef CONFIG_USER_ONLY
     tcg_iommu_init_notifier_list(cpu);

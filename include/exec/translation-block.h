@@ -124,9 +124,14 @@ struct TranslationBlock {
      * two of such jumps are supported.
      */
 #define TB_JMP_OFFSET_INVALID 0xffff /* indicates no jump generated */
-    uint16_t jmp_reset_offset[2]; /* offset of original jump target */
-    uint16_t jmp_insn_offset[2];  /* offset of direct jump insn */
-    uintptr_t jmp_target_addr[2]; /* target address */
+    /*
+     * iSH+: up to TB_MAX_JMPS jumps (ishjit's superblocks have one per
+     * conditional branch); TCG's TBs use the first two.
+     */
+#define TB_MAX_JMPS 6
+    uint16_t jmp_reset_offset[TB_MAX_JMPS]; /* offset of original jump target */
+    uint16_t jmp_insn_offset[TB_MAX_JMPS];  /* offset of direct jump insn */
+    uintptr_t jmp_target_addr[TB_MAX_JMPS]; /* target address */
     /*
      * iSH+ ishjit TBs (target/arm/tcg/ishjit.c): the offset of their fast
      * entry (guest registers already in host registers; 0: not an ishjit
@@ -134,9 +139,12 @@ struct TranslationBlock {
      * registers are stored, and its unchained target.
      */
     uint16_t ishjit_fast;
+    uint16_t ishjit_ras_id;         /* (its flags' id, ishjit.c ras_flag_id) */
+    uint8_t ishjit_cont;            /* (calls go on in the TB itself) */
     uint8_t ishjit_link;            /* (bit n: jump n is patched as a bl) */
-    int32_t ishjit_jmp2[2];         /* (cold code: after the TB, far) */
-    int32_t ishjit_jmp2_reset[2];
+    int32_t ishjit_jmp2[TB_MAX_JMPS];   /* (cold code: after the TB, far) */
+    int32_t ishjit_jmp2_reset[TB_MAX_JMPS];
+    int32_t ishjit_reset[TB_MAX_JMPS];  /* (unchained: cold code, or 0) */
 
     /*
      * Each TB has a NULL-terminated list (jmp_list_head) of incoming jumps.
@@ -156,8 +164,8 @@ struct TranslationBlock {
      * to a destination TB that has CF_INVALID set.
      */
     uintptr_t jmp_list_head;
-    uintptr_t jmp_list_next[2];
-    uintptr_t jmp_dest[2];
+    uintptr_t jmp_list_next[TB_MAX_JMPS];
+    uintptr_t jmp_dest[TB_MAX_JMPS];
 };
 
 /* The alignment given to TranslationBlock during allocation. */

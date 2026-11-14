@@ -237,6 +237,9 @@ static void arm_cpu_reset_hold(Object *obj, ResetType type)
     }
 
     memset(env, 0, offsetof(CPUARMState, end_reset_fields));
+    if (cpu->prop_ishjit) {
+        ishjit_env_reset(env);
+    }
 
     g_hash_table_foreach(cpu->cp_regs, cp_reg_reset, cpu);
     g_hash_table_foreach(cpu->cp_regs, cp_reg_check_reset, cpu);

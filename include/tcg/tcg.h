@@ -937,11 +937,12 @@ static inline size_t tcg_current_code_size(TCGContext *s)
  * to this default (which just calls the prologue.code emitted by
  * tcg_target_qemu_prologue()).
  */
-#define TB_EXIT_MASK      3
+/* (iSH+: 3 bits, for TB_MAX_JMPS jumps; TBs are 64-byte aligned) */
+#define TB_EXIT_MASK      7
 #define TB_EXIT_IDX0      0
 #define TB_EXIT_IDX1      1
-#define TB_EXIT_IDXMAX    1
-#define TB_EXIT_REQUESTED 3
+#define TB_EXIT_IDXMAX    (TB_MAX_JMPS - 1)
+#define TB_EXIT_REQUESTED 7
 
 #if defined(CONFIG_TCG_INTERPRETER) || defined(CONFIG_TCG_THREADED_INTERPRETER)
 uintptr_t tcg_qemu_tb_exec(CPUArchState *env, const void *tb_ptr);

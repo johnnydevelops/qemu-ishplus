@@ -282,6 +282,13 @@ typedef struct CPUArchState {
      */
     uint64_t ishjit_ras_top;
     uint64_t ishjit_ras[16][4];
+    /*
+     * iSH+ ishjit: the jump target cache (a table of { guest pc, tag as a
+     * return-address stack entry's, fast entry }), and scratch for it
+     */
+    uint64_t ishjit_ic;
+    uint64_t ishjit_ic_tmp[2];
+    uint8_t ishjit_icmap[1024];     /* (CPUState.ishjit_icmap) */
     /* PSTATE isn't an architectural register for ARMv8. However, it is
      * convenient for us to assemble the underlying state into a 32 bit format
      * identical to the architectural format used for the SPSR. (This is also
@@ -786,6 +793,7 @@ typedef struct CPUArchState {
 
     /* iSH+ ishjit: the shared routines' (RX) addresses (ishjit.c, ISHJIT_R_*) */
     uint64_t ishjit_routine[8];
+    void *ishjit_ic_alloc;          /* (env->ishjit_ic after a reset) */
 
     /* Fields after this point are preserved across CPU reset. */
 

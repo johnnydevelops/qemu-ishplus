@@ -25,5 +25,6 @@ const void *tcg_ishjit_tb_ret_addr(void);
 FILE *ishjit_pmap_get(void);
 
 void ishjit_enable(void *env);    /* (a CPUARMState) */
+void ishjit_env_reset(void *env); /* (after a CPU reset cleared its fields) */
 
 #endif
