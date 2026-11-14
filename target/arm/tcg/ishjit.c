@@ -3037,7 +3037,7 @@ static int ishjit_gen(CPUState *cs, TranslationBlock *tb, vaddr pc,
     struct { uint32_t *br; uint32_t insn; int kind; vaddr dest; uint32_t vw; }
         sbt[TB_MAX_JMPS];
     int nsbt = 0, ncond = 0, lastcond = -1;
-    static int sb_max = -1, sb_calls, sb_cond;
+    static int sb_max = -1, sb_calls, sb_cond, sb_groups;
     int n = 0, last;
     intptr_t slow0 = 0;
     uint32_t *full_b = NULL;
@@ -3093,6 +3093,7 @@ static int ishjit_gen(CPUState *cs, TranslationBlock *tb, vaddr pc,
         /* (and calls go on with the code after them, in the TB itself) */
         sb_calls = !getenv("ISHJIT_NOSBCALL");
         sb_cond = !getenv("ISHJIT_NOSBCOND");
+        sb_groups = !getenv("ISHJIT_NOSBGROUP");
     }
     j->mem_ok = !nomem && !EX_TBFLAG_ANY(tbf, ALIGN_MEM) &&
                 !EX_TBFLAG_A64(tbf, MTE_ACTIVE) &&
@@ -3304,9 +3305,15 @@ static int ishjit_gen(CPUState *cs, TranslationBlock *tb, vaddr pc,
                 for (int q = i - 1; q >= 0; q--) {
                     const MemInfo *mq = &mems[q];
 
+                    /*
+                     * (a superblock's conditional branches too: the code
+                     * after one is only reached through the code before)
+                     */
                     if ((written[q] >> m->rn & 1) ||
                         (kinds[q] != K_DP && kinds[q] != K_MEM && kinds[q] != K_FP &&
-                         kinds[q] != K_NOP && kinds[q] != K_ADR)) {
+                         kinds[q] != K_NOP && kinds[q] != K_ADR &&
+                         !(sb_groups && (kinds[q] == K_BCOND || kinds[q] == K_CB ||
+                                         kinds[q] == K_TB)))) {
                         break;
                     }
                     if (kinds[q] == K_MEM && mq->akind == A_NONE && mq->mode == M_IMM &&
