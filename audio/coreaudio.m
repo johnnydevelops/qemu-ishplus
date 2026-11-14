@@ -22,6 +22,9 @@
  * THE SOFTWARE.
  */
 
+#include <TargetConditionals.h>
+#if !TARGET_OS_IPHONE /* iOS has no audio devices (HAL): coreaudio-ios.m */
+
 #include "qemu/osdep.h"
 #include <CoreAudio/CoreAudio.h>
 #include <pthread.h>            /* pthread_X */
@@ -703,3 +706,5 @@ static void register_audio_coreaudio(void)
     audio_driver_register(&coreaudio_audio_driver);
 }
 type_init(register_audio_coreaudio);
+
+#endif /* !TARGET_OS_IPHONE */
