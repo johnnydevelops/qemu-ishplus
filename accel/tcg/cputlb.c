@@ -139,6 +139,36 @@ static inline CPUTLBEntry *tlb_entry(CPUState *cpu, uintptr_t mmu_idx,
     return &cpu->neg.tlb.f[mmu_idx].table[tlb_index(cpu, mmu_idx, addr)];
 }
 
+/*
+ * iSH+ debugging (ISHJIT_SLOWSTATS): why an access took ishjit's slow path:
+ * 0 main TLB hit without flags, 1 hit with flags (*fl), 2 victim TLB hit,
+ * 3 miss; *n = the TLB's entries
+ */
+int ishjit_tlb_probe_kind(CPUState *cpu, vaddr addr, int midx, bool write,
+                          int *fl, int *n);
+int ishjit_tlb_probe_kind(CPUState *cpu, vaddr addr, int midx, bool write,
+                          int *fl, int *n)
+{
+    CPUTLBEntry *e = tlb_entry(cpu, midx, addr);
+    uint64_t c = tlb_read_idx(e, write ? MMU_DATA_STORE : MMU_DATA_LOAD);
+    CPUTLBDesc *d = &cpu->neg.tlb.d[midx];
+
+    *n = tlb_n_entries(&cpu->neg.tlb.f[midx]);
+    *fl = 0;
+    if ((c & (TARGET_PAGE_MASK | TLB_INVALID_MASK)) == (addr & TARGET_PAGE_MASK)) {
+        *fl = c & TLB_FLAGS_MASK;
+        return *fl ? 1 : 0;
+    }
+    for (int k = 0; k < CPU_VTLB_SIZE; k++) {
+        uint64_t v = tlb_read_idx(&d->vtable[k], write ? MMU_DATA_STORE : MMU_DATA_LOAD);
+
+        if ((v & (TARGET_PAGE_MASK | TLB_INVALID_MASK)) == (addr & TARGET_PAGE_MASK)) {
+            return 2;
+        }
+    }
+    return 3;
+}
+
 static void tlb_window_reset(CPUTLBDesc *desc, int64_t ns,
                              size_t max_entries)
 {
@@ -1646,6 +1676,20 @@ static bool victim_tlb_hit(CPUState *cpu, size_t mmu_idx, size_t index,
         if (cmp == page) {
             /* Found entry in victim tlb, swap tlb and iotlb.  */
             CPUTLBEntry tmptlb, *tlb = &cpu->neg.tlb.f[mmu_idx].table[index];
+            CPUTLBDesc *desc = &cpu->neg.tlb.d[mmu_idx];
+
+            /*
+             * iSH+: a swap is a conflict in the main TLB too (pages that
+             * share an index taking turns): counted as an eviction, so that
+             * a TLB too small for a program grows (tlb_set_page_full). At
+             * the threshold, a miss: the fill grows it.
+             */
+            if (unlikely(++desc->ishplus_evictions >=
+                         tlb_n_entries(&cpu->neg.tlb.f[mmu_idx]) &&
+                         tlb_n_entries(&cpu->neg.tlb.f[mmu_idx]) <
+                         (1 << ISHPLUS_TLB_GROW_MAX_BITS))) {
+                return false;
+            }
 
             qemu_spin_lock(&cpu->neg.tlb.c.lock);
             copy_tlb_helper_locked(&tmptlb, tlb);

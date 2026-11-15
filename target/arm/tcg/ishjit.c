@@ -3230,6 +3230,52 @@ static uint64_t ij_tbi(uint64_t a, int tbid)
     return a;
 }
 
+/* debugging: ISHJIT_SLOWSTATS=1, why the slow path (printed at exit) */
+int ishjit_tlb_probe_kind(CPUState *cpu, vaddr addr, int midx, bool write,
+                          int *fl, int *n);
+static int slowstats = -1;
+static uint64_t ss_kind[8], ss_flags[64], ss_size[32], ss_cross, ss_tot;
+static void ss_dump(void)
+{
+    static const char *k[] = { "hit, no flags", "hit, flags", "victim hit", "miss" };
+
+    fprintf(stderr, "ISHJIT slow paths %llu, page crossing %llu\n",
+            (unsigned long long)ss_tot, (unsigned long long)ss_cross);
+    for (int i = 0; i < 4; i++) {
+        fprintf(stderr, "ISHJIT slow %-14s %llu\n", k[i], (unsigned long long)ss_kind[i]);
+    }
+    for (int i = 0; i < 64; i++) {
+        if (ss_flags[i]) {
+            fprintf(stderr, "ISHJIT slow flags %#x: %llu\n", i << 5, (unsigned long long)ss_flags[i]);
+        }
+    }
+    for (int i = 0; i < 32; i++) {
+        if (ss_size[i]) {
+            fprintf(stderr, "ISHJIT slow at TLB size 2^%d: %llu\n", i, (unsigned long long)ss_size[i]);
+        }
+    }
+}
+static void ij_slowstat(CPUARMState *env, uint64_t addr, uint32_t w, int midx)
+{
+    int fl, n, kd;
+
+    if (w & (IJD_ZVA | IJD_MRSIO | IJD_SYS)) {
+        return;
+    }
+    ss_tot++;
+    if ((addr & ~TARGET_PAGE_MASK) + (1 << IJD_SIZE(w)) * ((w & IJD_PAIR) ? 2 : 1) >
+        TARGET_PAGE_SIZE) {
+        ss_cross++;
+        return;
+    }
+    kd = ishjit_tlb_probe_kind(env_cpu(env), addr, midx, !(w & IJD_LOAD), &fl, &n);
+    ss_kind[kd]++;
+    if (kd == 1) {
+        ss_flags[(fl >> 5) & 63]++;
+    }
+    ss_size[ctz32(n) & 31]++;
+}
+
 /*
  * Vector structures (decode_vstruct) through QEMU's helpers, on env's V
  * registers (the block's save thunk stored them; its restore reloads them):
@@ -3345,6 +3391,12 @@ IJSlowRet ishjit_slow_c(CPUARMState *env, uint64_t addr, const uint32_t *desc)
     IJSlowRet r = { ra, desc[2] ? (uintptr_t)desc + (int32_t)desc[2] : 0 };
     MemOp align;
 
+    if (unlikely(slowstats < 0)) {
+        slowstats = getenv("ISHJIT_SLOWSTATS") != NULL;
+        if (slowstats) {
+            atexit(ss_dump);
+        }
+    }
     if (w & IJD_SYS) {
         /* (exceptions from here: env->pc exact, everything stored) */
         env->pc = (env->pc & TARGET_PAGE_MASK) | desc[4];
@@ -3398,6 +3450,9 @@ IJSlowRet ishjit_slow_c(CPUARMState *env, uint64_t addr, const uint32_t *desc)
     }
     /* (the TB's flags are env's: a change of them ends the TB) */
     align = EX_TBFLAG_ANY(env->hflags, ALIGN_MEM) ? MO_ALIGN : 0;
+    if (unlikely(slowstats)) {
+        ij_slowstat(env, addr, w, midx);
+    }
     if (w & IJD_VST) {
         ishjit_vstruct_slow(env, addr, desc[3], midx, ra, align);
         return r;
