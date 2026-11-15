@@ -50,6 +50,22 @@ void helper_exception_return(CPUArchState *env, uint64_t new_pc);
 void helper_msr_i_daifset(CPUArchState *env, uint32_t imm);
 void helper_msr_i_daifclear(CPUArchState *env, uint32_t imm);
 uint64_t helper_get_cp_reg64(CPUArchState *env, const void *rip);
+void helper_set_cp_reg64(CPUArchState *env, const void *rip, uint64_t value);
+const void *helper_access_check_cp_reg(CPUArchState *env, uint32_t key,
+                                       uint32_t syndrome, uint32_t isread);
+void helper_wfi(CPUArchState *env, uint32_t insn_len);
+void helper_wfe(CPUArchState *env);
+void helper_yield(CPUArchState *env);
+void helper_pre_hvc(CPUArchState *env);
+void helper_pre_smc(CPUArchState *env, uint32_t syndrome);
+void helper_tidcp_el0(CPUArchState *env, uint32_t syndrome);
+void helper_tidcp_el1(CPUArchState *env, uint32_t syndrome);
+void helper_msr_i_spsel(CPUArchState *env, uint32_t imm);
+void helper_msr_set_allint_el1(CPUArchState *env);
+void helper_dc_zva(CPUArchState *env, uint64_t vaddr_in);
+void helper_rebuild_hflags_a64(CPUArchState *env, int el);
+void helper_ishplus_rebuild_hflags_keyed(CPUArchState *env, int el);
+static bool ishjit_sys_do(CPUARMState *env, uint32_t insn);
 
 /*
  * Registers. Host x18 is Apple's (zeroed on context switches), host SP must
@@ -113,6 +129,7 @@ typedef struct {
     int mmu_idx;
     int tbid;
     bool mem_ok;
+    bool align_mem;             /* TB flag ALIGN_MEM (SCTLR.A, or the MMU off) */
     unsigned page_bits;
     int el;
     /* slow paths of the block's memory accesses */
@@ -395,6 +412,14 @@ static bool decode_dp(uint32_t insn, OperandInfo *o)
 
     if ((insn & 0x0E000000) != 0x0A000000) {
         return false;
+    }
+    /* FlagM: rmif xn, #imm, #mask; setf8, setf16 wn (NZCV from a register) */
+    if ((insn & 0xFFE07C10) == 0xBA000400 || (insn & 0xFFFFBC1F) == 0x3A00080D) {
+        o->rn = F_ZR;
+        o->rd = F_NONE;
+        o->rd_written = false;
+        o->reads_flags = o->writes_flags = true;
+        return true;
     }
     /* DP register */
     if ((insn & 0x1F000000) == 0x0A000000) {        /* logical shifted reg */
@@ -1517,7 +1542,9 @@ enum { M_IMM, M_REG, M_LIT };
  */
 enum { A_NONE, A_LDAR, A_LDAPR, A_STLR, A_LSE, A_CAS, A_LDX, A_STX,
        A_ZVA /* (DC ZVA: a block of zeros; desc IJD_ZVA) */,
-       A_MRSIO /* (a counter read: through the slow path; IJD_MRSIO) */ };
+       A_MRSIO /* (a counter read: through the slow path; IJD_MRSIO) */,
+       A_SYS /* (a system insn in C: ishjit_sys_do; IJD_SYS) */,
+       A_CASP, A_LDXP, A_STXP /* (pairs; the desc: as A_LSE) */ };
 enum { WB_NONE, WB_PRE, WB_POST };
 
 typedef struct {
@@ -1532,6 +1559,16 @@ typedef struct {
     uint8_t rt, rt2, rn, rm;
     uint8_t mode, wb, option, shift;
     bool prefetch;
+    bool cslow;             /* (always the slow path: C does it all) */
+    bool rcpc2;             /* (ldapur, stlur: A_LDAPR, A_STLR with an offset) */
+    /*
+     * AdvSIMD load/store (multiple or single) structures: the guest insn
+     * itself on the host address; vbytes bytes, V registers vmask; post-index
+     * by a register: wbreg (Rm), else by imm
+     */
+    bool vstruct, wbreg;
+    uint8_t vbytes;
+    uint32_t vmask;
     int64_t imm;            /* byte offset (or the literal's pc offset) */
 } MemInfo;
 
@@ -1558,6 +1595,21 @@ static bool decode_atomic(uint32_t insn, MemInfo *m)
         m->opc = 1;
         return true;
     }
+    if ((insn & 0x3F200C00) == 0x19000000) {                     /* stlur, ldapur(s) */
+        unsigned opc = (insn >> 22) & 3;
+
+        if ((size == 3 && opc >= 2) || (size == 2 && opc == 3)) {
+            return false;
+        }
+        m->rcpc2 = true;
+        m->akind = opc == 0 ? A_STLR : A_LDAPR;
+        m->imm = sextract32(insn, 12, 9);
+        m->opc = opc;
+        m->load = opc != 0;
+        m->sign = opc >= 2;
+        m->dest32 = opc == 3;
+        return true;
+    }
     if ((insn & 0x3FFF7C00) == 0x085F7C00) {                     /* ldxr, ldaxr */
         m->akind = A_LDX;
         m->load = true;
@@ -1575,6 +1627,36 @@ static bool decode_atomic(uint32_t insn, MemInfo *m)
         m->akind = A_CAS;
         return true;
     }
+    /* pairs: casp, ldxp, stxp (W or X registers, size per register) */
+    if ((insn & 0xBFA07C00) == 0x08207C00) {                     /* casp(a)(l) */
+        if ((m->rs | m->rt) & 1) {
+            return false;                                       /* (unallocated) */
+        }
+        m->akind = A_CASP;
+        m->size = 2 + ((insn >> 30) & 1);
+        m->pair = true;
+        m->rt2 = m->rt + 1;
+        return true;
+    }
+    if ((insn & 0xBFFF0000) == 0x887F0000) {                     /* ld(a)xp */
+        m->akind = A_LDXP;
+        m->size = 2 + ((insn >> 30) & 1);
+        m->pair = true;
+        m->load = true;
+        m->rt2 = (insn >> 10) & 31;
+        return true;
+    }
+    if ((insn & 0xBFE00000) == 0x88200000) {                     /* st(l)xp */
+        m->rt2 = (insn >> 10) & 31;
+        /* (status == data or base: UNPREDICTABLE, left to TCG) */
+        if (m->rs == m->rt || m->rs == m->rt2 || (m->rs == m->rn && m->rn != 31)) {
+            return false;
+        }
+        m->akind = A_STXP;
+        m->size = 2 + ((insn >> 30) & 1);
+        m->pair = true;
+        return true;
+    }
     if ((insn & 0x3B200C00) == 0x38200000 && !(insn & (1u << 26))) {
         unsigned o3 = (insn >> 15) & 1, opc = (insn >> 12) & 7;
 
@@ -1586,6 +1668,81 @@ static bool decode_atomic(uint32_t insn, MemInfo *m)
     return false;
 }
 
+/*
+ * AdvSIMD load/store multiple structures and single structure (LD1-LD4,
+ * ST1-ST4, LD1R-LD4R): the bytes, registers, writeback; false if
+ * unallocated (as the Arm ARM's decode)
+ */
+static bool decode_vstruct(uint32_t insn, MemInfo *m)
+{
+    bool q = (insn >> 30) & 1, post = (insn >> 23) & 1;
+    unsigned rm = (insn >> 16) & 31, opcode = (insn >> 12) & 15, size = (insn >> 10) & 3;
+    int nregs, total;
+
+    if ((insn & 0xBFBF0000) == 0x0C000000 || (insn & 0xBFA00000) == 0x0C800000) {
+        static const int8_t rpt[16] = { 1, 0, 4, 0, 1, 0, 3, 1, 1, 0, 2, 0, 0, 0, 0, 0 };
+        static const int8_t sel[16] = { 4, 0, 1, 0, 3, 0, 1, 1, 2, 0, 1, 0, 0, 0, 0, 0 };
+
+        if (!rpt[opcode] || (size == 3 && !q && sel[opcode] > 1)) {
+            return false;
+        }
+        nregs = rpt[opcode] * sel[opcode];
+        total = nregs * (q ? 16 : 8);
+    } else if ((insn & 0xBF9F0000) == 0x0D000000 || (insn & 0xBF800000) == 0x0D800000) {
+        unsigned opc3 = opcode >> 1, sbit = opcode & 1, r = (insn >> 21) & 1;
+        unsigned scale = opc3 >> 1;
+        int selem = ((opc3 & 1) << 1 | r) + 1;
+
+        switch (scale) {
+        case 3:
+            if (!((insn >> 22) & 1) || sbit) {
+                return false;                       /* (ld-r only) */
+            }
+            scale = size;
+            break;
+        case 1:
+            if (size & 1) {
+                return false;
+            }
+            break;
+        case 2:
+            if (size & 2) {
+                return false;
+            }
+            if (size & 1) {
+                if (sbit) {
+                    return false;
+                }
+                scale = 3;
+            }
+            break;
+        }
+        nregs = selem;
+        total = selem << scale;
+    } else {
+        return false;
+    }
+    m->vstruct = true;
+    m->vec = true;
+    m->load = (insn >> 22) & 1;
+    m->mode = M_IMM;
+    m->vbytes = total;
+    m->vmask = 0;
+    for (int k = 0; k < nregs; k++) {
+        m->vmask |= 1u << ((m->rt + k) & 31);
+    }
+    if (post) {
+        m->wb = WB_POST;
+        if (rm == 31) {
+            m->imm = total;
+        } else {
+            m->wbreg = true;
+            m->rm = rm;
+        }
+    }
+    return true;
+}
+
 static bool decode_mem(uint32_t insn, MemInfo *m, bool fp_ok)
 {
     memset(m, 0, sizeof(*m));
@@ -1593,6 +1750,9 @@ static bool decode_mem(uint32_t insn, MemInfo *m, bool fp_ok)
     m->rn = (insn >> 5) & 31;
     if (decode_atomic(insn, m)) {
         return true;
+    }
+    if ((insn & 0xBE000000) == 0x0C000000) {
+        return fp_ok && decode_vstruct(insn, m);
     }
     static int nosp = -1;
 
@@ -1738,7 +1898,7 @@ static void mem_regs(const MemInfo *m, uint32_t *reads, uint32_t *writes)
             *writes |= 1u << m->rn;
         }
     }
-    if (m->mode == M_REG && m->rm != 31) {
+    if ((m->mode == M_REG || m->wbreg) && m->rm != 31) {
         *reads |= 1u << m->rm;
     }
     if (m->vec) {
@@ -1768,6 +1928,28 @@ static void mem_regs(const MemInfo *m, uint32_t *reads, uint32_t *writes)
         }
         if (m->rt != 31) {
             *reads |= 1u << m->rt;
+        }
+        return;
+    case A_CASP:                                    /* Rs:Rs+1 expected/old, Rt:Rt+1 new */
+        for (int k = 0; k < 2; k++) {
+            if (m->rs + k != 31) {
+                *reads |= 1u << (m->rs + k);
+                *writes |= 1u << (m->rs + k);
+            }
+            if (m->rt + k != 31) {
+                *reads |= 1u << (m->rt + k);
+            }
+        }
+        return;
+    case A_STXP:                                    /* Ws status, Rt, Rt2 data */
+        if (m->rs != 31) {
+            *writes |= 1u << m->rs;
+        }
+        if (m->rt != 31) {
+            *reads |= 1u << m->rt;
+        }
+        if (m->rt2 != 31) {
+            *reads |= 1u << m->rt2;
         }
         return;
     }
@@ -1874,18 +2056,105 @@ void ishjit_atomic_slow(CPUARMState *env, uint64_t addr, uint32_t insn,
         }
         break;
     }
+    /*
+     * Pairs, as TCG's gen_compare_and_swap_pair, gen_load_exclusive and
+     * gen_store_exclusive (FEAT_LSE2: a W pair only within 16 bytes)
+     */
+    case A_CASP:
+    case A_LDXP:
+    case A_STXP: {
+#define IJ_X(r) ((r) == 31 ? 0 : env->xregs[r])
+#define IJ_SETX(r, v) do { if ((r) != 31) { env->xregs[r] = (v); } } while (0)
+        bool w = m.size == 2;
+        bool lse2 = cpu_isar_feature(aa64_lse2, env_archcpu(env));
+        MemOp a64 = MO_64 | MO_LE |
+                    ((m.akind == A_STXP ? !lse2 : (addr & 15) + 8 > 16) ? MO_ALIGN : 0);
+        MemOpIdx o64 = make_memop_idx(a64, mmu_idx);
+        MemOpIdx o128 = make_memop_idx(MO_128 | MO_ALIGN | MO_LE, mmu_idx);
+        int rt2 = m.akind == A_CASP ? m.rt + 1 : m.rt2;
+
+        if (m.akind == A_CASP) {
+            if (w) {
+                uint64_t c = (uint32_t)IJ_X(m.rs) | IJ_X(m.rs + 1) << 32;
+                uint64_t v = (uint32_t)IJ_X(m.rt) | IJ_X(rt2) << 32;
+
+                old = cpu_atomic_cmpxchgq_le_mmu(env, addr, c, v, o64, ra);
+                IJ_SETX(m.rs, (uint32_t)old);
+                IJ_SETX(m.rs + 1, old >> 32);
+            } else {
+                Int128 o = cpu_atomic_cmpxchgo_le_mmu(
+                    env, addr, int128_make128(IJ_X(m.rs), IJ_X(m.rs + 1)),
+                    int128_make128(IJ_X(m.rt), IJ_X(rt2)), o128, ra);
+
+                IJ_SETX(m.rs, int128_getlo(o));
+                IJ_SETX(m.rs + 1, int128_gethi(o));
+            }
+        } else if (m.akind == A_LDXP) {
+            if (w) {
+                old = cpu_ldq_mmu(env, addr, o64, ra);
+                env->exclusive_val = old;
+                IJ_SETX(m.rt, (uint32_t)old);
+                IJ_SETX(rt2, old >> 32);
+            } else {
+                Int128 v = cpu_ld16_mmu(env, addr,
+                                        make_memop_idx(MO_128 | MO_ALIGN | MO_LE |
+                                                       MO_ATOM_IFALIGN_PAIR, mmu_idx), ra);
+
+                env->exclusive_val = int128_getlo(v);
+                env->exclusive_high = int128_gethi(v);
+                IJ_SETX(m.rt, env->exclusive_val);
+                IJ_SETX(rt2, env->exclusive_high);
+            }
+            env->exclusive_addr = addr;
+        } else {
+            uint64_t status = 1;
+
+            if (addr == env->exclusive_addr) {
+                if (w) {
+                    uint64_t v = (uint32_t)IJ_X(m.rt) | IJ_X(rt2) << 32;
+
+                    old = cpu_atomic_cmpxchgq_le_mmu(env, addr, env->exclusive_val, v, o64, ra);
+                    status = old != env->exclusive_val;
+                } else {
+                    Int128 o = cpu_atomic_cmpxchgo_le_mmu(
+                        env, addr, int128_make128(env->exclusive_val, env->exclusive_high),
+                        int128_make128(IJ_X(m.rt), IJ_X(rt2)), o128, ra);
+
+                    status = ((int128_getlo(o) ^ env->exclusive_val) |
+                              (int128_gethi(o) ^ env->exclusive_high)) != 0;
+                }
+            }
+            env->exclusive_addr = -1;
+            IJ_SETX(m.rs, status);
+        }
+#undef IJ_X
+#undef IJ_SETX
+        break;
+    }
     }
 }
 
+/*
+ * K_SYSC: a system instruction done by C code (ishjit_sys_do) through the
+ * slow path, the TB going on after it; K_SYSEND: the same, then the TB ends
+ * (as TCG's TB would: the TB flags or interrupts may have changed)
+ */
 enum { K_STOP, K_DP, K_NOP, K_ADR, K_MEM, K_FP, K_COPY, K_CLREX, K_MRS, K_MSR,
        K_MRSCONST, K_DAIFSET, K_DAIFCLR, K_DCZVA, K_MSRDAIF, K_MRSIO, K_DCZID,
-       K_B, K_BL, K_BCOND, K_CB, K_TB, K_BREG, K_SVC, K_BRK, K_ERET, K_ISB };
+       K_NZCV, K_SYSC,
+       K_B, K_BL, K_BCOND, K_CB, K_TB, K_BREG, K_SVC, K_BRK, K_ERET, K_ISB,
+       K_SYSEND };
 
 /* System instructions ishjit handles itself (others: TCG) */
 static int classify_sys(uint32_t insn, IJ *j, unsigned *off, bool *spcheck)
 {
     unsigned crm = (insn >> 8) & 15;
 
+    /* (op0 = 0 encodings with Rt not 31: unallocated, UNDEF in C) */
+    if ((insn & 0xFFF80000) == 0xD5000000 && (insn & 31) != 31 &&
+        !((insn & 0xFFFFF0C0) == 0xD5031000)) {         /* (but WFET, WFIT) */
+        return K_SYSEND;
+    }
     if ((insn & 0xFFFFF01F) == 0xD503201F) {            /* hints */
         unsigned h = (insn >> 5) & 0x7f;
 
@@ -1897,9 +2166,24 @@ static int classify_sys(uint32_t insn, IJ *j, unsigned *off, bool *spcheck)
             (h >= 8 && h <= 15) || h == 17 || h == 18 || h == 20 ||
             h == 22 || (h >= 24 && h <= 31) || h == 32 || h == 34 ||
             h == 36 || h == 38) {
+            if (h == 1 && !(tb_cflags(j->tb) & CF_PARALLEL)) {
+                return K_SYSEND;                        /* yield */
+            }
             return K_NOP;
         }
-        return K_STOP;
+        /* WFE: a no-op with other vCPUs running in parallel, as TCG's */
+        if (h == 2) {
+            return (tb_cflags(j->tb) & CF_PARALLEL) ? K_NOP : K_SYSEND;
+        }
+        if (h == 3) {
+            return K_SYSEND;                            /* wfi */
+        }
+        /* ESB: a no-op without EL2 (virtual SErrors), as TCG's */
+        if (h == 16 && j->el2_el3) {
+            return K_STOP;
+        }
+        /* the rest of the hint space: no-ops (no FEAT_PAuth, FEAT_BTI) */
+        return K_NOP;
     }
     if ((insn & 0xFFFFF0FF) == 0xD50330BF ||            /* dmb */
         (insn & 0xFFFFF0FF) == 0xD503309F) {            /* dsb */
@@ -1913,7 +2197,7 @@ static int classify_sys(uint32_t insn, IJ *j, unsigned *off, bool *spcheck)
          * At EL1 always allowed (no EL2), at EL0 if SCTLR_EL1.DZE (checked
          * at run time); a block of at most 128 bytes
          */
-        if (j->mem_ok && !j->el2_el3 && j->el <= 1 &&
+        if (j->mem_ok && !j->align_mem && !j->el2_el3 && j->el <= 1 &&
             (4 << env_archcpu(j->env)->dcz_blocksize) <= 128 &&
             offsetof(CPUARMState, cp15.sctlr_el[1]) / 8 <= 4095) {
             return K_DCZVA;
@@ -1923,27 +2207,76 @@ static int classify_sys(uint32_t insn, IJ *j, unsigned *off, bool *spcheck)
     if ((insn & 0xFFFFF0FF) == 0xD50330DF) {            /* isb */
         return K_ISB;
     }
+    /* nzcv: the host's own (mrs/msr nzcv, xt) */
+    if ((insn & 0xFFDFFFE0) == 0xD51B4200) {
+        return K_NZCV;
+    }
+    /* CurrentEL: the TB's EL */
+    if ((insn & 0xFFFFFFE0) == 0xD5384240) {
+        j->sysconst = j->el << 2;
+        return K_MRSCONST;
+    }
     if ((insn & 0xFFFFF0FF) == 0xD503305F) {            /* clrex */
         return K_CLREX;
     }
     /* interrupt masking (the kernel's local_irq_*): at EL1, no traps */
     if ((insn & 0xFFFFF0FF) == 0xD50340DF) {            /* msr daifset, #imm */
-        return j->el == 1 ? K_DAIFSET : K_STOP;
+        return j->el == 1 ? K_DAIFSET : K_SYSEND;
     }
     if ((insn & 0xFFFFF0FF) == 0xD50340FF) {            /* msr daifclr, #imm */
-        return j->el == 1 ? K_DAIFCLR : K_STOP;
+        return j->el == 1 ? K_DAIFCLR : K_SYSEND;
     }
     if ((insn & 0xFFFFFFE0) == 0xD51B4220) {            /* msr daif, xt */
-        return j->el == 1 && !j->fgt_active ? K_MSRDAIF : K_STOP;
+        return j->el == 1 && !j->fgt_active ? K_MSRDAIF : K_SYSEND;
     }
     if ((insn & 0xFFE0001F) == 0xD4000001) {            /* svc */
-        return j->el == 0 && !j->fgt_svc ? K_SVC : K_STOP;
+        return j->el == 0 && !j->fgt_svc ? K_SVC : j->fgt_svc ? K_STOP : K_SYSEND;
     }
     if ((insn & 0xFFE0001F) == 0xD4200000) {            /* brk */
         return K_BRK;
     }
     if (insn == 0xD69F03E0) {                           /* eret */
-        return j->el == 1 && !j->trap_eret ? K_ERET : K_STOP;
+        return j->el == 1 && !j->trap_eret ? K_ERET :
+               j->el == 0 ? K_SYSEND : K_STOP;          /* (EL0: UNDEF) */
+    }
+    /* hvc, smc (PSCI calls, or UNDEF), hlt (not semihosting), dcps: in C */
+    if ((insn & 0xFFE0001C) == 0xD4000000 && (insn & 3) >= 2) {
+        return K_SYSEND;                                /* hvc, smc */
+    }
+    if ((insn & 0xFFE0001F) == 0xD4400000) {            /* hlt */
+        return ((insn >> 5) & 0xffff) == 0xf000 ? K_STOP : K_SYSEND;
+    }
+    if ((insn & 0xFFE0001C) == 0xD4A00000 && (insn & 3)) {
+        return K_SYSEND;                                /* dcps1-3: UNDEF */
+    }
+    /* thread pointers (plain fields, no traps without fine-grained traps) */
+    if (!j->fgt_active) {
+        switch (insn & 0xFFFFFFE0) {
+        case 0xD53BD040:                                /* mrs tpidr_el0 */
+            *off = offsetof(CPUARMState, cp15.tpidr_el[0]);
+            return K_MRS;
+        case 0xD53BD060:                                /* mrs tpidrro_el0 */
+            *off = offsetof(CPUARMState, cp15.tpidrro_el[0]);
+            return K_MRS;
+        case 0xD51BD040:                                /* msr tpidr_el0 */
+            *off = offsetof(CPUARMState, cp15.tpidr_el[0]);
+            return K_MSR;
+        case 0xD538D080:                                /* mrs tpidr_el1 */
+            if (j->el == 1) {
+                *off = offsetof(CPUARMState, cp15.tpidr_el[1]);
+                return K_MRS;
+            }
+            break;
+        case 0xD5384100:                                /* mrs sp_el0 */
+        case 0xD5184100:                                /* msr sp_el0 */
+            /* (Linux's current task; accessible at EL1 unless PSTATE.SP 0) */
+            if (j->el == 1) {
+                *off = offsetof(CPUARMState, sp_el[0]);
+                *spcheck = true;
+                return (insn & 0x00200000) ? K_MRS : K_MSR;
+            }
+            break;
+        }
     }
     /*
      * Other system registers, from QEMU's own table (as TCG's handle_sys):
@@ -1959,9 +2292,11 @@ static int classify_sys(uint32_t insn, IJ *j, unsigned *off, bool *spcheck)
         const ARMCPRegInfo *ri = get_arm_cp_reginfo(env_archcpu(j->env)->cp_regs, key);
         int t;
 
-        if (!ri || !cp_access_ok(j->el, ri, isread) ||
-            (ri->fgt && j->fgt_active)) {
-            goto other;
+        if (!ri || !cp_access_ok(j->el, ri, isread)) {
+            return K_SYSEND;                            /* (UNDEF) */
+        }
+        if (ri->fgt && j->fgt_active) {
+            goto sysc;
         }
         /*
          * The counters (CNT[PV]CT[SS]_EL0, the kernel's sched_clock and
@@ -1983,18 +2318,21 @@ static int classify_sys(uint32_t insn, IJ *j, unsigned *off, bool *spcheck)
         }
         if (ri->accessfn &&
             arm_cpreg_ishplus_access(ri, j->el, j->el2_el3) != 1) {
-            goto other;
+            goto sysc;
         }
         t = ri->type;
         if (op0 == 1 && (t & ARM_CP_SPECIAL_MASK) != ARM_CP_NOP) {
-            goto other;                 /* (SYS: only what QEMU ignores) */
+            goto sysc;                  /* (SYS: only what QEMU ignores) */
         }
         if (t & ARM_CP_SPECIAL_MASK) {
-            return (t & ARM_CP_SPECIAL_MASK) == ARM_CP_NOP ? K_NOP : K_STOP;
+            if ((t & ARM_CP_SPECIAL_MASK) == ARM_CP_NOP) {
+                return K_NOP;
+            }
+            goto sysc;
         }
         if (t & (ARM_CP_IO | ARM_CP_RAISES_EXC | ARM_CP_NEWEL | ARM_CP_FPU |
                  ARM_CP_SVE | ARM_CP_SME)) {
-            goto other;
+            goto sysc;
         }
         if (t & ARM_CP_CONST) {
             if (!isread) {
@@ -2005,10 +2343,10 @@ static int classify_sys(uint32_t insn, IJ *j, unsigned *off, bool *spcheck)
             return K_MRSCONST;
         }
         if (!ri->fieldoffset) {
-            goto other;
+            goto sysc;
         }
         if (ri->fieldoffset % 8 || ri->fieldoffset / 8 > 4095) {
-            goto other;                 /* (beyond a plain ldr/str) */
+            goto sysc;                  /* (beyond a plain ldr/str) */
         }
         if (isread && !ri->readfn) {
             *off = ri->fieldoffset;
@@ -2018,33 +2356,40 @@ static int classify_sys(uint32_t insn, IJ *j, unsigned *off, bool *spcheck)
             *off = ri->fieldoffset;
             return K_MSR;
         }
-    }
-other:
-    /* thread pointers (plain fields, no traps without fine-grained traps) */
-    if (!j->fgt_active) {
-        switch (insn & 0xFFFFFFE0) {
-        case 0xD53BD040:                                /* mrs tpidr_el0 */
-            *off = offsetof(CPUARMState, cp15.tpidr_el[0]);
-            return K_MRS;
-        case 0xD53BD060:                                /* mrs tpidrro_el0 */
-            *off = offsetof(CPUARMState, cp15.tpidrro_el[0]);
-            return K_MRS;
-        case 0xD51BD040:                                /* msr tpidr_el0 */
-            *off = offsetof(CPUARMState, cp15.tpidr_el[0]);
-            return K_MSR;
-        case 0xD538D080:                                /* mrs tpidr_el1 */
-            *off = offsetof(CPUARMState, cp15.tpidr_el[1]);
-            return j->el == 1 ? K_MRS : K_STOP;
-        case 0xD5384100:                                /* mrs sp_el0 */
-        case 0xD5184100:                                /* msr sp_el0 */
-            /* (Linux's current task; accessible at EL1 unless PSTATE.SP 0) */
-            *off = offsetof(CPUARMState, sp_el[0]);
-            *spcheck = true;
-            if (j->el != 1) {
-                return K_STOP;
-            }
-            return (insn & 0x00200000) ? K_MRS : K_MSR;
+    sysc:
+        /*
+         * The rest in C, as TCG's handle_sys: the TB ends after writes
+         * that would end TCG's (the TB flags may change) and I/O
+         */
+        t = ri->type;
+        if ((t & (ARM_CP_SVE | ARM_CP_SME)) ||
+            ((t & ARM_CP_SPECIAL_MASK) != 0 && (t & ARM_CP_SPECIAL_MASK) != ARM_CP_NOP &&
+             (t & ARM_CP_SPECIAL_MASK) != ARM_CP_NZCV &&
+             (t & ARM_CP_SPECIAL_MASK) != ARM_CP_CURRENTEL &&
+             (t & ARM_CP_SPECIAL_MASK) != ARM_CP_DC_ZVA)) {
+            return K_STOP;              /* (not with the A13's features) */
         }
+        if ((!isread && !(t & ARM_CP_SUPPRESS_TB_END) &&
+             (t & ARM_CP_SPECIAL_MASK) != ARM_CP_NOP &&
+             (t & ARM_CP_SPECIAL_MASK) != ARM_CP_DC_ZVA &&
+             (t & ARM_CP_SPECIAL_MASK) != ARM_CP_NZCV) ||
+            (t & ARM_CP_IO)) {
+            return K_SYSEND;
+        }
+        return K_SYSC;
+    }
+    /* the rest of op0 = 0 (PSTATE fields, WFxT, SB, DSB nXS...): in C */
+    if ((insn & 0xFFD80000) == 0xD5000000) {
+        int crn = (insn >> 12) & 15, op1 = (insn >> 16) & 7, op2 = (insn >> 5) & 7;
+
+        if (crn == 4 && op1 == 0 && op2 <= 2 && !(insn & 0x0F00)) {
+            return K_SYSC;              /* cfinv, xaflag, axflag (NZCV) */
+        }
+        if (crn == 4 && op1 == 3 && op2 == 4 &&
+            !cpu_isar_feature(aa64_mte, env_archcpu(j->env))) {
+            return K_SYSC;              /* msr tco: WI (or UNDEF) */
+        }
+        return K_SYSEND;
     }
     return K_STOP;
 }
@@ -2062,9 +2407,10 @@ static bool fp_copyable(uint32_t insn, SimdOperands *g, IJ *j)
         !ishjit_simd_decode(insn, g)) {
         return false;
     }
-    if (g->sets_qc || (g->reads_fpcr_mode && !j->fp_default)) {
-        return false;
-    }
+    /*
+     * (FPSR.QC: the host's, folded in as the other cumulative flags; FP
+     * with a non-default FPCR: under the guest's FPCR, see K_FP)
+     */
     return true;
 }
 
@@ -2104,6 +2450,15 @@ static void fp_regs(uint32_t insn, const SimdOperands *g, uint32_t *reads,
 static int classify(uint32_t insn, OperandInfo *o, MemInfo *m, bool mem_ok,
                     bool fp_ok, SimdOperands *g, IJ *j)
 {
+    /* (instructions of features the guest CPU may lack: TCG's UNDEF) */
+    if (((insn & 0xFFE07C10) == 0xBA000400 || (insn & 0xFFFFBC1F) == 0x3A00080D) &&
+        !cpu_isar_feature(aa64_condm_4, env_archcpu(j->env))) {
+        return K_STOP;
+    }
+    if ((insn & 0x3F200C00) == 0x19000000 &&
+        !cpu_isar_feature(aa64_rcpc_8_4, env_archcpu(j->env))) {
+        return K_STOP;
+    }
     if (mem_ok && decode_mem(insn, m, fp_ok)) {
         m->midx = j->mmu_idx;
         if (m->unpriv && j->unpriv) {
@@ -2142,6 +2497,15 @@ static int classify(uint32_t insn, OperandInfo *o, MemInfo *m, bool mem_ok,
     }
     if (fp_copyable(insn, g, j)) {
         return K_FP;
+    }
+    /* FP/SIMD while it traps (CPACR_EL1.FPEN): the trap, in C */
+    if (!fp_ok) {
+        MemInfo t;
+
+        if (((insn & 0x0E000000) == 0x0E000000 && ishjit_simd_decode(insn, g)) ||
+            (decode_mem(insn, &t, true) && t.vec)) {
+            return K_SYSEND;            /* (ishjit_sys_do: not a system insn) */
+        }
     }
 
     if (insn == 0xD503201F) {
@@ -2218,7 +2582,13 @@ static void emit_atomic_access(IJ *j, const MemInfo *m, int accsize)
                 emit(j, i_ldr_x(rt, H_ENV, xreg_off(m->rt)));
             }
         }
-        emit(j, (uint32_t)sz << 30 | op | H_TMP2 << 5 | rt);
+        if (m->rcpc2) {
+            /* the guest's ldapur(s)/stlur (its sign extension), offset 0 */
+            emit(j, (j->cur_insn & ~(0x1FFu << 12 | 0x1Fu << 5 | 0x1Fu)) |
+                    H_TMP2 << 5 | rt);
+        } else {
+            emit(j, (uint32_t)sz << 30 | op | H_TMP2 << 5 | rt);
+        }
         if (envr && m->akind != A_STLR) {
             emit(j, i_str_x(rt, H_ENV, xreg_off(m->rt)));
         }
@@ -2252,6 +2622,10 @@ static void emit_atomic_access(IJ *j, const MemInfo *m, int accsize)
         }
         break;
     }
+    case A_CASP:
+        /* (its registers the host's own: classify) the guest's insn on x27 */
+        emit(j, (j->cur_insn & ~(0x1Fu << 5)) | H_TMP2 << 5);
+        break;
     case A_LDX: {
         /* the value (zero-extended) in x17 */
         if (j->cur_insn & (1u << 15)) {
@@ -2347,6 +2721,12 @@ static void emit_addr(IJ *j, const MemInfo *m, vaddr ipc)
 /* The access itself, x27 the host address of its last byte */
 static void emit_access(IJ *j, const MemInfo *m, int accsize)
 {
+    if (m->vstruct) {
+        /* the guest's insn (no offset form) on [x27] */
+        emit_addi(j, H_TMP2, H_TMP2, -(accsize - 1));
+        emit(j, (j->cur_insn & ~(1u << 23 | 0x1Fu << 16 | 0x1Fu << 5)) | H_TMP2 << 5);
+        return;
+    }
     if (m->akind == A_ZVA) {
         emit_addi(j, H_TMP2, H_TMP2, -(accsize - 1));
         for (int o = 0; o < accsize; o += 16) {
@@ -2446,13 +2826,20 @@ static void emit_tlb_access(IJ *j, const MemInfo *m, IJSlow *sl, int accsize)
                           : offsetof(CPUTLBEntry, addr_write);
 
     sl->cbnz2 = NULL;
-    if (m->akind != A_NONE && m->akind != A_ZVA && m->size) {
-        /* atomics, exclusives, ordered: naturally aligned (else the slow path) */
-        emit(j, 0x92400000 | (m->size - 1) << 10 | H_TMP0 << 5 | H_TMP1);  /* and x17, x16, #(size-1) */
+    if (((m->akind != A_NONE && m->akind != A_ZVA) || (j->align_mem && m->akind == A_NONE)) &&
+        m->size) {
+        /*
+         * atomics, exclusives, ordered: naturally aligned (else the slow
+         * path); with ALIGN_MEM, every access (each register's size)
+         */
+        int asz = m->akind == A_CASP ? m->size + 1 : m->size;   /* (casp: the pair's) */
+
+        emit(j, 0x92400000 | (asz - 1) << 10 | H_TMP0 << 5 | H_TMP1);  /* and x17, x16, #(size-1) */
         sl->cbnz2 = j->ptr;
         emit(j, 0);
     }
-    if (m->akind == A_LSE || m->akind == A_CAS || m->akind == A_STX) {
+    if (m->akind == A_LSE || m->akind == A_CAS || m->akind == A_STX ||
+        m->akind == A_CASP) {
         cmp_off = offsetof(CPUTLBEntry, addr_write);
     }
 
@@ -2616,7 +3003,7 @@ static void emit_mem(IJ *j, const MemInfo *m, vaddr ipc, IJSlow *sl)
 
 static void emit_mem_(IJ *j, const MemInfo *m, vaddr ipc, IJSlow *sl)
 {
-    int accsize = (1 << m->size) * (m->pair ? 2 : 1);
+    int accsize = m->vstruct ? m->vbytes : (1 << m->size) * (m->pair ? 2 : 1);
 
     sl->gkind = 0;
     if (j->g_role == 1) {
@@ -2665,6 +3052,14 @@ static void emit_mem_(IJ *j, const MemInfo *m, vaddr ipc, IJSlow *sl)
             emit_access(j, m, accsize);
         }
         sl->gkind = 2;
+    } else if (m->cslow) {
+        /* (x16: the last byte, as after a TLB check; then always slow) */
+        emit_addr(j, m, ipc);
+        emit_addi(j, H_TMP0, H_TMP0, accsize - 1);
+        sl->cbnz2 = NULL;
+        sl->allslow = true;
+        sl->cbnz = j->ptr;
+        emit(j, 0);                                 /* b slow */
     } else {
         emit_addr(j, m, ipc);
         emit_tlb_access(j, m, sl, accsize);
@@ -2673,7 +3068,22 @@ static void emit_mem_(IJ *j, const MemInfo *m, vaddr ipc, IJSlow *sl)
     sl->ipc = ipc;
     sl->resume = j->ptr;
 
-    if (m->wb != WB_NONE) {
+    if (m->wbreg) {
+        /* (vector structures) Rn += Xm */
+        int b = g2h[m->rn], r = g2h[m->rm];
+
+        if (r == H_NONE) {
+            emit(j, i_ldr_x(H_TMP1, H_ENV, xreg_off(m->rm)));
+            r = H_TMP1;
+        }
+        if (b == H_NONE) {
+            emit(j, i_ldr_x(H_TMP0, H_ENV, xreg_off(m->rn)));
+            emit(j, 0x8B000000 | r << 16 | H_TMP0 << 5 | H_TMP0);   /* add x16, x16, xm */
+            emit(j, i_str_x(H_TMP0, H_ENV, xreg_off(m->rn)));
+        } else {
+            emit(j, 0x8B000000 | r << 16 | b << 5 | b);             /* add xn, xn, xm */
+        }
+    } else if (m->wb != WB_NONE) {
         int b = g2h[m->rn];
 
         if (b == H_NONE) {
@@ -2750,13 +3160,16 @@ static const void *st_helper(int size)
 #define IJD_LIT         (1u << 27)
 #define IJD_ZVA         (1u << 28)
 #define IJD_MRSIO       (1u << 29)
+#define IJD_SYS         (1u << 30)
+#define IJD_VST         (1u << 31)
 
 static void emit_slow_desc(IJ *j, const IJSlow *sl, uint32_t *save, uint32_t *restore)
 {
     const MemInfo *m = &sl->m;
     uint32_t *adr = j->ptr, *d;
     bool atomic = m->akind == A_LSE || m->akind == A_CAS || m->akind == A_LDX ||
-                  m->akind == A_STX;
+                  m->akind == A_STX || m->akind == A_CASP || m->akind == A_LDXP ||
+                  m->akind == A_STXP;
 
     g_assert(m->midx >= 0 && m->midx < 16 && m->size <= 4);
     emit(j, 0);                                     /* adr x27, desc */
@@ -2766,14 +3179,24 @@ static void emit_slow_desc(IJ *j, const IJSlow *sl, uint32_t *save, uint32_t *re
     emit(j, m->size | (m->load ? IJD_LOAD : 0) | (m->pair ? IJD_PAIR : 0) |
             (m->sign ? IJD_SIGN : 0) | (m->dest32 ? IJD_DEST32 : 0) |
             (m->vec ? IJD_VEC : 0) | (m->akind == A_ZVA ? IJD_ZVA :
-                                      m->akind == A_MRSIO ? IJD_MRSIO : m->akind << 8) |
+                                      m->akind == A_MRSIO ? IJD_MRSIO :
+                                      m->akind == A_SYS ? IJD_SYS :
+                                      (m->akind >= A_CASP ? A_LSE : m->akind) << 8) |
             m->rt << 11 | m->rt2 << 16 |
-            m->midx << 21 | (j->tbid & 3) << 25 | (m->mode == M_LIT ? IJD_LIT : 0));
+            m->midx << 21 | (j->tbid & 3) << 25 | (m->mode == M_LIT ? IJD_LIT : 0) |
+            (m->vstruct ? IJD_VST : 0));
     ij_fixup(FX_C2H_REL, j->ptr, sl->resume, d);
     emit(j, 0);                                     /* (resume - desc) */
     emit(j, j->vused ? (uint32_t)((restore - d) * 4) : 0);
     if (atomic) {
         emit(j, sl->insn);
+    }
+    if (m->vstruct) {
+        emit(j, sl->insn);                          /* [3] the insn */
+    }
+    if (m->akind == A_SYS) {
+        emit(j, sl->insn);                          /* [3] the insn */
+        emit(j, sl->ipc & ~TARGET_PAGE_MASK);       /* [4] its pc's page offset */
     }
     if (m->akind == A_MRSIO) {
         emit(j, sl->insn);                          /* (the access check's syndrome) */
@@ -2787,7 +3210,7 @@ static void emit_slow(IJ *j, const IJSlow *sl, uint32_t *save, uint32_t *restore
                       uint32_t **after_sub)
 {
     const MemInfo *m = &sl->m;
-    int accsize = (1 << m->size) * (m->pair ? 2 : 1);
+    int accsize = m->vstruct ? m->vbytes : (1 << m->size) * (m->pair ? 2 : 1);
 
     if (accsize > 1) {
         emit_addi(j, H_TMP0, H_TMP0, -(accsize - 1));
@@ -2807,6 +3230,112 @@ static uint64_t ij_tbi(uint64_t a, int tbid)
     return a;
 }
 
+/*
+ * Vector structures (decode_vstruct) through QEMU's helpers, on env's V
+ * registers (the block's save thunk stored them; its restore reloads them):
+ * the Arm ARM's LD/ST multiple and single structure loops, element by element
+ */
+static void ishjit_vstruct_slow(CPUARMState *env, uint64_t addr, uint32_t insn,
+                                int midx, uintptr_t ra, MemOp align)
+{
+    bool q = (insn >> 30) & 1, load = (insn >> 22) & 1;
+    unsigned opcode = (insn >> 12) & 15, size = (insn >> 10) & 3, t = insn & 31;
+    uint64_t offs = 0;
+
+#define IJ_VB(v) ((uint8_t *)env + vreg_off(v))
+    if (!(insn & (1u << 24))) {
+        /* multiple structures */
+        static const int8_t rpt[16] = { 1, 0, 4, 0, 1, 0, 3, 1, 1, 0, 2, 0, 0, 0, 0, 0 };
+        static const int8_t sel[16] = { 4, 0, 1, 0, 3, 0, 1, 1, 2, 0, 1, 0, 0, 0, 0, 0 };
+        int eb = 1 << size, elements = (q ? 16 : 8) >> size;
+        MemOpIdx oi = make_memop_idx(size | MO_LE | align, midx);
+
+        for (int r = 0; r < rpt[opcode]; r++) {
+            for (int e = 0; e < elements; e++) {
+                for (int sx = 0; sx < sel[opcode]; sx++) {
+                    uint8_t *p = IJ_VB((t + r + sx) & 31) + e * eb;
+                    uint64_t v;
+
+                    if (load) {
+                        v = ((uint64_t (*)(CPUArchState *, uint64_t, MemOpIdx, uintptr_t))
+                             ld_helper(size, false))(env, addr + offs, oi, ra);
+                        memcpy(p, &v, eb);
+                    } else {
+                        v = 0;
+                        memcpy(&v, p, eb);
+                        ((void (*)(CPUArchState *, uint64_t, uint64_t, MemOpIdx, uintptr_t))
+                         st_helper(size))(env, addr + offs, v, oi, ra);
+                    }
+                    offs += eb;
+                }
+            }
+        }
+        if (load && !q) {
+            for (int k = 0; k < rpt[opcode] * sel[opcode]; k++) {
+                memset(IJ_VB((t + k) & 31) + 8, 0, 8);
+            }
+        }
+    } else {
+        /* single structure (an element, or replicated) */
+        unsigned opc3 = opcode >> 1, sbit = opcode & 1, rbit = (insn >> 21) & 1;
+        unsigned scale = opc3 >> 1, index = 0;
+        int selem = ((opc3 & 1) << 1 | rbit) + 1;
+        bool replicate = false;
+
+        switch (scale) {
+        case 3:
+            replicate = true;
+            scale = size;
+            break;
+        case 0:
+            index = q << 3 | sbit << 2 | size;
+            break;
+        case 1:
+            index = q << 2 | sbit << 1 | size >> 1;
+            break;
+        case 2:
+            if (!(size & 1)) {
+                index = q << 1 | sbit;
+            } else {
+                index = q;
+                scale = 3;
+            }
+            break;
+        }
+        {
+            int eb = 1 << scale;
+            MemOpIdx oi = make_memop_idx(scale | MO_LE | align, midx);
+
+            for (int sx = 0; sx < selem; sx++) {
+                uint8_t *p = IJ_VB((t + sx) & 31);
+                uint64_t v;
+
+                if (load) {
+                    v = ((uint64_t (*)(CPUArchState *, uint64_t, MemOpIdx, uintptr_t))
+                         ld_helper(scale, false))(env, addr + offs, oi, ra);
+                    if (replicate) {
+                        for (int e = 0; e < (q ? 16 : 8); e += eb) {
+                            memcpy(p + e, &v, eb);
+                        }
+                        if (!q) {
+                            memset(p + 8, 0, 8);
+                        }
+                    } else {
+                        memcpy(p + index * eb, &v, eb);
+                    }
+                } else {
+                    v = 0;
+                    memcpy(&v, p + index * eb, eb);
+                    ((void (*)(CPUArchState *, uint64_t, uint64_t, MemOpIdx, uintptr_t))
+                     st_helper(scale))(env, addr + offs, v, oi, ra);
+                }
+                offs += eb;
+            }
+        }
+    }
+#undef IJ_VB
+}
+
 IJSlowRet ishjit_slow_c(CPUARMState *env, uint64_t addr, const uint32_t *desc)
 {
     uint32_t w = desc[0];
@@ -2814,7 +3343,14 @@ IJSlowRet ishjit_slow_c(CPUARMState *env, uint64_t addr, const uint32_t *desc)
     int rt = IJD_RT(w), rt2 = IJD_RT2(w);
     uintptr_t ra = (uintptr_t)desc + (int32_t)desc[1];
     IJSlowRet r = { ra, desc[2] ? (uintptr_t)desc + (int32_t)desc[2] : 0 };
+    MemOp align;
 
+    if (w & IJD_SYS) {
+        /* (exceptions from here: env->pc exact, everything stored) */
+        env->pc = (env->pc & TARGET_PAGE_MASK) | desc[4];
+        ishjit_sys_do(env, desc[3]);
+        return r;
+    }
     if (w & IJD_MRSIO) {
         /* a counter's read, as helper_get_cp_reg64 (gt_*_access at EL0) */
         const ARMCPRegInfo *ri =
@@ -2860,20 +3396,41 @@ IJSlowRet ishjit_slow_c(CPUARMState *env, uint64_t addr, const uint32_t *desc)
     if (!(w & IJD_LIT)) {
         addr = ij_tbi(addr, IJD_TBID(w));
     }
+    /* (the TB's flags are env's: a change of them ends the TB) */
+    align = EX_TBFLAG_ANY(env->hflags, ALIGN_MEM) ? MO_ALIGN : 0;
+    if (w & IJD_VST) {
+        ishjit_vstruct_slow(env, addr, desc[3], midx, ra, align);
+        return r;
+    }
     if (akind == A_LSE || akind == A_CAS || akind == A_LDX || akind == A_STX) {
         ishjit_atomic_slow(env, addr, desc[3], ra, midx);
         return r;
     }
     if (akind != A_NONE) {
+        /* (FEAT_LSE2: unaligned is fine within 16 bytes, as TCG's check) */
+        if (!(w & IJD_VEC) && ((addr & 15) + (1 << size) > 16 ||
+                               !cpu_isar_feature(aa64_lse2, env_archcpu(env))) &&
+            (addr & ((1 << size) - 1))) {
+            arm_cpu_do_unaligned_access(env_cpu(env), addr,
+                                        (w & IJD_LOAD) ? MMU_DATA_LOAD : MMU_DATA_STORE,
+                                        midx, ra);
+        }
         smp_mb();                                   /* (ordered access) */
     }
     if (w & IJD_VEC) {
         /* through env's image of the V registers, 8 bytes at a time */
         int hsz = MIN(size, 3);
-        MemOpIdx voi = make_memop_idx(hsz | MO_LE, midx);
+        MemOpIdx voi = make_memop_idx(hsz | MO_LE | align, midx);
 
         for (int k = 0; k < ((w & IJD_PAIR) ? 2 : 1); k++) {
             int v = k ? rt2 : rt;
+
+            if (align && size == 4 && ((addr + k * 16) & 15)) {
+                /* (Q: aligned to 16, not just the halves' 8) */
+                arm_cpu_do_unaligned_access(env_cpu(env), addr + k * 16,
+                                            (w & IJD_LOAD) ? MMU_DATA_LOAD : MMU_DATA_STORE,
+                                            midx, ra);
+            }
 
             for (int c = 0; c < (size == 4 ? 2 : 1); c++) {
                 uint64_t *p = (uint64_t *)((uint8_t *)env + vreg_off(v) + 8 * c);
@@ -2898,7 +3455,8 @@ IJSlowRet ishjit_slow_c(CPUARMState *env, uint64_t addr, const uint32_t *desc)
         return r;
     }
     {
-        MemOpIdx oi = make_memop_idx(size | MO_LE | ((w & IJD_SIGN) ? MO_SIGN : 0), midx);
+        MemOpIdx oi = make_memop_idx(size | MO_LE | ((w & IJD_SIGN) ? MO_SIGN : 0) | align,
+                                     midx);
         int n = (w & IJD_PAIR) ? 2 : 1;
         uint64_t v[2];
 
@@ -3163,6 +3721,286 @@ void ishjit_take_exception(CPUARMState *env, uint32_t excp, uint32_t syn)
 }
 
 /*
+ * System instructions ishjit leaves to C (K_SYSC, K_SYSEND), as TCG's
+ * translate-a64.c does them: everything stored, env->pc this insn's (for
+ * the exceptions they raise). Returns whether it set env->pc itself.
+ */
+static G_NORETURN void sys_undef(CPUARMState *env, uint32_t syn)
+{
+    raise_exception(env, EXCP_UDEF, syn, exception_target_el(env));
+}
+
+static void sys_set_nzcv(CPUARMState *env, uint64_t v)
+{
+    env->NF = (uint32_t)v;
+    env->ZF = !(v & PSTATE_Z);
+    env->CF = (v >> 29) & 1;
+    env->VF = (uint32_t)v << 3;
+}
+
+static uint64_t sys_get_nzcv(CPUARMState *env)
+{
+    return (env->NF & 0x80000000u) | (env->ZF ? 0 : PSTATE_Z) |
+           (env->CF ? PSTATE_C : 0) | ((env->VF >> 31) << 28);
+}
+
+static bool ishjit_sys_do(CPUARMState *env, uint32_t insn)
+{
+    ARMCPU *cpu = env_archcpu(env);
+    int el = arm_current_el(env);
+    int rt = insn & 31;
+    uint64_t xt = rt == 31 ? 0 : env->xregs[rt];
+    int op0 = (insn >> 19) & 3, op1 = (insn >> 16) & 7, crn = (insn >> 12) & 15;
+    int crm = (insn >> 8) & 15, op2 = (insn >> 5) & 7;
+    bool l = insn & (1u << 21);
+
+    if ((insn & 0xFE000000) != 0xD4000000 && insn != 0xD69F03E0) {
+        /* an FP/SIMD insn while FP traps (classify), as TCG's fp_access_check */
+        raise_exception(env, EXCP_UDEF, syn_fp_access_trap(1, 0xe, false, 0),
+                        fp_exception_el(env, el));
+    }
+    if (insn == 0xD69F03E0) {                       /* eret at EL0 */
+        sys_undef(env, syn_uncategorized());
+    }
+    if ((insn & 0xFF000000) == 0xD4000000) {        /* exception generation */
+        unsigned opc = (insn >> 21) & 7, ll = insn & 3, imm = (insn >> 5) & 0xffff;
+
+        if (opc == 0 && ll == 1) {                  /* svc (not EL0) */
+            env->pc += 4;
+            raise_exception(env, EXCP_SWI, syn_aa64_svc(imm), exception_target_el(env));
+        }
+        if (opc == 0 && ll == 2 && el > 0) {        /* hvc (PSCI) */
+            helper_pre_hvc(env);
+            env->pc += 4;
+            raise_exception(env, EXCP_HVC, syn_aa64_hvc(imm), el == 3 ? 3 : 2);
+        }
+        if (opc == 0 && ll == 3 && el > 0) {        /* smc */
+            helper_pre_smc(env, syn_aa64_smc(imm));
+            env->pc += 4;
+            raise_exception(env, EXCP_SMC, syn_aa64_smc(imm), 3);
+        }
+        sys_undef(env, syn_uncategorized());        /* (hlt, dcps) */
+    }
+    g_assert((insn & 0xFFC00000) == 0xD5000000);
+    if (op0 == 0 && rt != 31) {
+        sys_undef(env, syn_uncategorized());        /* (WFxT: not with a13) */
+    }
+    if (op0 == 0) {
+        if (!l && crn == 2 && op1 == 3) {           /* hints */
+            unsigned h = crm << 3 | op2;
+
+            if (h == 3) {
+                env->pc += 4;
+                helper_wfi(env, 4);
+                return true;
+            }
+            if (h == 1 || h == 2) {
+                env->pc += 4;
+                helper_yield(env);                  /* (wfe: the same) */
+                return true;
+            }
+            return false;
+        }
+        if (!l && crn == 4 && op1 == 0 && op2 <= 2 && crm == 0) {
+            uint32_t c = env->CF, z = env->ZF == 0;
+
+            if (op2 == 0 && cpu_isar_feature(aa64_condm_4, cpu)) {
+                env->CF ^= 1;                       /* cfinv */
+                return false;
+            }
+            if (op2 == 1 && cpu_isar_feature(aa64_condm_5, cpu)) {
+                env->NF = (c | z) - 1;              /* xaflag */
+                env->ZF = (z & c) ^ 1;
+                env->VF = -(z & ~c);
+                env->CF = c | z;
+                return false;
+            }
+            if (op2 == 2 && cpu_isar_feature(aa64_condm_5, cpu)) {
+                uint32_t v = (int32_t)env->VF >> 31;    /* axflag */
+
+                env->CF &= ~v;
+                env->ZF &= ~v;
+                env->NF = 0;
+                env->VF = 0;
+                return false;
+            }
+            sys_undef(env, syn_uncategorized());
+        }
+        if (!l && crn == 4) {                       /* msr (immediate) */
+            switch (op1 << 3 | op2) {
+            case 0 << 3 | 3:                        /* uao */
+            case 0 << 3 | 4:                        /* pan */
+                if (el == 0 || !(op2 == 3 ? cpu_isar_feature(aa64_uao, cpu) :
+                                            cpu_isar_feature(aa64_pan, cpu))) {
+                    break;
+                }
+                if (crm & 1) {
+                    env->pstate |= op2 == 3 ? PSTATE_UAO : PSTATE_PAN;
+                } else {
+                    env->pstate &= ~(uint64_t)(op2 == 3 ? PSTATE_UAO : PSTATE_PAN);
+                }
+                helper_rebuild_hflags_a64(env, el);
+                return false;
+            case 0 << 3 | 5:                        /* spsel */
+                if (el == 0) {
+                    break;
+                }
+                helper_msr_i_spsel(env, crm & PSTATE_SP);
+                return false;
+            case 3 << 3 | 1:                        /* ssbs */
+            case 3 << 3 | 2:                        /* dit */
+                if (!(op2 == 1 ? cpu_isar_feature(aa64_ssbs, cpu) :
+                                 cpu_isar_feature(aa64_dit, cpu))) {
+                    break;
+                }
+                if (crm & 1) {
+                    env->pstate |= op2 == 1 ? PSTATE_SSBS : PSTATE_DIT;
+                } else {
+                    env->pstate &= ~(uint64_t)(op2 == 1 ? PSTATE_SSBS : PSTATE_DIT);
+                }
+                return false;
+            case 3 << 3 | 4:                        /* tco */
+                if (cpu_isar_feature(aa64_mte, cpu)) {
+                    if (crm & 1) {
+                        env->pstate |= PSTATE_TCO;
+                    } else {
+                        env->pstate &= ~(uint64_t)PSTATE_TCO;
+                    }
+                    helper_rebuild_hflags_a64(env, el);
+                    return false;
+                }
+                if (cpu_isar_feature(aa64_mte_insn_reg, cpu)) {
+                    return false;                   /* (WI) */
+                }
+                break;
+            case 3 << 3 | 6:
+                helper_msr_i_daifset(env, crm);
+                return false;
+            case 3 << 3 | 7:
+                helper_msr_i_daifclear(env, crm);
+                return false;
+            case 1 << 3 | 0:                        /* allint */
+                if (!cpu_isar_feature(aa64_nmi, cpu) || el == 0 || (crm >> 1)) {
+                    break;
+                }
+                if (!(crm & 1)) {
+                    env->pstate &= ~(uint64_t)PSTATE_ALLINT;
+                } else if (el > 1) {
+                    env->pstate |= PSTATE_ALLINT;
+                } else {
+                    helper_msr_set_allint_el1(env);
+                }
+                return false;
+            }
+            sys_undef(env, syn_uncategorized());
+        }
+        if (!l && crn == 3 && op1 == 3 &&
+            ((op2 == 7 && crm == 0 && cpu_isar_feature(aa64_sb, cpu)) ||
+             (op2 == 1 && (crm & 3) == 2 && cpu_isar_feature(aa64_xs, cpu)))) {
+            smp_mb();                               /* sb, dsb nxs */
+            return false;
+        }
+        sys_undef(env, syn_uncategorized());        /* (WFxT: not with a13) */
+    }
+
+    /* MRS, MSR (register), SYS, SYSL: as TCG's handle_sys */
+    {
+        uint32_t key = ENCODE_AA64_CP_REG(CP_REG_ARM64_SYSREG_CP, crn, crm, op0, op1, op2);
+        const ARMCPRegInfo *ri = get_arm_cp_reginfo(cpu->cp_regs, key);
+        bool isread = l;
+        uint32_t syn = syn_aa64_sysregtrap(op0, op1, op2, crn, crm, rt, isread);
+        uint64_t v;
+
+        if (crn == 11 || crn == 15) {
+            if (el == 0 && cpu_isar_feature(aa64_tidcp1, cpu)) {
+                helper_tidcp_el0(env, syn);
+            } else if (el == 1) {
+                helper_tidcp_el1(env, syn);
+            }
+        }
+        if (!ri || !cp_access_ok(el, ri, isread)) {
+            if (isread && cpu_isar_feature(aa64_ids, cpu) &&
+                arm_cpreg_encoding_in_idspace(op0, op1, op2, crn, crm)) {
+                sys_undef(env, syn);
+            }
+            sys_undef(env, syn_uncategorized());
+        }
+        if (ri->accessfn || (ri->fgt && arm_fgt_active(env, el))) {
+            helper_access_check_cp_reg(env, key, syn, isread);
+        }
+        if (ri->type & ARM_CP_FPU) {
+            int fel = fp_exception_el(env, el);
+
+            if (fel) {
+                raise_exception(env, EXCP_UDEF, syn_fp_access_trap(1, 0xe, false, 0), fel);
+            }
+        }
+        switch (ri->type & ARM_CP_SPECIAL_MASK) {
+        case 0:
+            break;
+        case ARM_CP_NOP:
+            return false;
+        case ARM_CP_NZCV:
+            if (!isread) {
+                sys_set_nzcv(env, xt);
+            } else if (rt != 31) {
+                env->xregs[rt] = sys_get_nzcv(env);
+            }
+            return false;
+        case ARM_CP_CURRENTEL:
+            if (isread && rt != 31) {
+                env->xregs[rt] = el << 2;
+            }
+            return false;
+        case ARM_CP_DC_ZVA:
+            helper_dc_zva(env, ij_tbi(xt, EX_TBFLAG_A64(env->hflags, TBID)));
+            return false;
+        default:
+            g_assert_not_reached();     /* (classify: not these) */
+        }
+        if (isread) {
+            if (ri->type & ARM_CP_CONST) {
+                v = ri->resetvalue;
+            } else if (ri->readfn) {
+                v = helper_get_cp_reg64(env, ri);
+            } else {
+                v = *(uint64_t *)((uint8_t *)env + ri->fieldoffset);
+            }
+            if (rt != 31) {
+                env->xregs[rt] = v;
+            }
+            return false;
+        }
+        if (ri->type & ARM_CP_CONST) {
+            return false;
+        }
+        if (ri->writefn) {
+            helper_set_cp_reg64(env, ri, xt);
+        } else {
+            *(uint64_t *)((uint8_t *)env + ri->fieldoffset) = xt;
+        }
+        if (!(ri->type & ARM_CP_SUPPRESS_TB_END)) {
+            if (ri->state == ARM_CP_STATE_AA64 &&
+                ri->fieldoffset == offsetof(CPUARMState, daif)) {
+                helper_ishplus_rebuild_hflags_keyed(env, el);
+            } else {
+                helper_rebuild_hflags_a64(env, el);
+            }
+        }
+        return false;
+    }
+}
+
+/* K_SYSEND: as ishjit_sys_do, then env->pc the next insn's */
+void ishjit_sys_end(CPUARMState *env, uint32_t insn);
+void ishjit_sys_end(CPUARMState *env, uint32_t insn)
+{
+    if (!ishjit_sys_do(env, insn)) {
+        env->pc += 4;
+    }
+}
+
+/*
  * After a helper that may unmask interrupts (ERET, DAIFClr), registers
  * stored, env->pc the next insn's: back to cpu_exec only with an interrupt
  * pending (as TCG's exit), else straight to the next TB (its full entry).
@@ -3273,7 +4111,8 @@ static int ishjit_gen(CPUState *cs, TranslationBlock *tb, vaddr pc,
         nocbenv = getenv("ISHJIT_NOCBENV") != NULL;
         sb_groups = !getenv("ISHJIT_NOSBGROUP");
     }
-    j->mem_ok = !nomem && !EX_TBFLAG_ANY(tbf, ALIGN_MEM) &&
+    j->align_mem = EX_TBFLAG_ANY(tbf, ALIGN_MEM);
+    j->mem_ok = !nomem &&
                 !EX_TBFLAG_A64(tbf, MTE_ACTIVE) &&
                 !EX_TBFLAG_A64(tbf, MTE0_ACTIVE) &&
                 tlb_fast_off(j->mmu_idx) >= -512 &&
@@ -3321,15 +4160,41 @@ static int ishjit_gen(CPUState *cs, TranslationBlock *tb, vaddr pc,
         case K_MSR:
             rd = (insn & 31) == 31 ? 0 : 1u << (insn & 31);
             break;
+        case K_NZCV:
+        case K_SYSC:
+        case K_SYSEND:
+            /* (the C ones: Xt may be read or written) */
+            rd = (insn & 31) == 31 ? 0 : 1u << (insn & 31);
+            if (k != K_NZCV || (insn & (1u << 21))) {
+                wr = rd;
+            }
+            if (k == K_NZCV && !(insn & (1u << 21))) {
+                j->flags_written = j->flags_out = true;
+            }
+            break;
         case K_MEM:
             if (mems[n].akind == A_STX && mems[n].rt != 31 &&
                 g2h[mems[n].rt] == H_NONE) {
-                k = K_STOP;                 /* (no scratch left for it) */
-                break;
+                mems[n].cslow = true;       /* (no scratch left for it) */
+            }
+            if (mems[n].akind == A_LDXP || mems[n].akind == A_STXP ||
+                (mems[n].vstruct && j->align_mem)) {
+                mems[n].cslow = true;
+            }
+            if (mems[n].akind == A_CASP) {
+                /* inline: Rs, Rs+1, Rt, Rt+1 in the same host registers */
+                for (int r = 0; r < 2; r++) {
+                    int a = mems[n].rs + r, b = mems[n].rt + r;
+
+                    if (a == 31 || b == 31 || g2h[a] != a || g2h[b] != b) {
+                        mems[n].cslow = true;
+                    }
+                }
             }
             mem_regs(&mems[n], &rd, &wr);
             if (mems[n].vec) {
-                uint32_t v = 1u << mems[n].rt | (mems[n].pair ? 1u << mems[n].rt2 : 0);
+                uint32_t v = mems[n].vstruct ? mems[n].vmask :
+                             1u << mems[n].rt | (mems[n].pair ? 1u << mems[n].rt2 : 0);
 
                 j->vused |= v;
                 if (mems[n].load) {
@@ -3375,7 +4240,9 @@ static int ishjit_gen(CPUState *cs, TranslationBlock *tb, vaddr pc,
         {
             uint32_t mem = (rd | wr) & ENV_HELD;
 
-            if (((k == K_DP || k == K_FP) && ctpop32(mem) > 3) ||
+            /* (a 4th: a destination only written can share a source's scratch) */
+            if ((k == K_DP && (ctpop32(rd & ENV_HELD) > 3 || ctpop32(mem) > 4)) ||
+                (k == K_FP && ctpop32(mem) > 3) ||
                 ((k == K_CB || k == K_TB) && mem && nocbenv)) {
                 break;
             }
@@ -3449,8 +4316,17 @@ static int ishjit_gen(CPUState *cs, TranslationBlock *tb, vaddr pc,
         tbnz = j->ptr;
         emit(j, 0);                             /* b exit */
         tb->ishjit_fast = ij_offset(j);
-        emit(j, i_ldur_w(H_TMP0, H_ENV, off));
-        emit(j, 0x37000000 | 31 << 19 | ((tbnz - j->ptr) & 0x3fff) << 5 | H_TMP0);
+        if (tb_cflags(tb) & CF_NOIRQ) {
+            /*
+             * (an I/O insn run again on its own, cpu_io_recompile: no
+             * interrupt before it; CF_MEMI_ONLY only concerns plugins)
+             */
+            emit(j, 0xD503201F);
+            emit(j, 0xD503201F);
+        } else {
+            emit(j, i_ldur_w(H_TMP0, H_ENV, off));
+            emit(j, 0x37000000 | 31 << 19 | ((tbnz - j->ptr) & 0x3fff) << 5 | H_TMP0);
+        }
         emit_checkenv(j, 1);
         emit_xcount(j, XC_ENTRY, 1);
         emit_xcount(j, XC_INSNS, n);
@@ -3475,12 +4351,14 @@ static int ishjit_gen(CPUState *cs, TranslationBlock *tb, vaddr pc,
             if (nogroup < 0) {
                 nogroup = getenv("ISHJIT_NOGROUP") != NULL;
             }
+            /* (alignment checks: each access its own) */
+            bool nogrp = nogroup || j->align_mem;
             for (int i = 0; i < n; i++) {
                 const MemInfo *m = &mems[i];
                 int acc = (1 << m->size) * (m->pair ? 2 : 1);
 
                 glead[i] = -1;
-                if (nogroup || kinds[i] != K_MEM || m->akind != A_NONE ||
+                if (nogrp || kinds[i] != K_MEM || m->akind != A_NONE || m->vstruct ||
                     m->mode != M_IMM || m->wb != WB_NONE) {
                     continue;
                 }
@@ -3498,7 +4376,8 @@ static int ishjit_gen(CPUState *cs, TranslationBlock *tb, vaddr pc,
                                          kinds[q] == K_TB)))) {
                         break;
                     }
-                    if (kinds[q] == K_MEM && mq->akind == A_NONE && mq->mode == M_IMM &&
+                    if (kinds[q] == K_MEM && mq->akind == A_NONE && !mq->vstruct &&
+                        mq->mode == M_IMM &&
                         mq->wb == WB_NONE && mq->rn == m->rn && mq->midx == m->midx) {
                         int L = glead[q];
                         int64_t lo, hi;
@@ -3653,6 +4532,62 @@ static int ishjit_gen(CPUState *cs, TranslationBlock *tb, vaddr pc,
                 end_off[i] = ij_offset(j);
                 emit_jump(j, ipc + 4);              /* (ends the TB, as TCG) */
                 break;
+            case K_NZCV: {
+                int g = insn & 31, h = g == 31 ? 31 : g2h[g];
+
+                if (insn & (1u << 21)) {            /* mrs xt, nzcv */
+                    if (g == 31) {
+                        break;
+                    }
+                    emit(j, 0xD53B4200 | (h == H_NONE ? H_TMP0 : h));
+                    if (h == H_NONE) {
+                        emit(j, i_str_x(H_TMP0, H_ENV, xreg_off(g)));
+                    }
+                } else {                            /* msr nzcv, xt */
+                    if (h == H_NONE) {
+                        emit(j, i_ldr_x(H_TMP0, H_ENV, xreg_off(g)));
+                        h = H_TMP0;
+                    }
+                    emit(j, 0xD51B4200 | h);
+                }
+                break;
+            }
+            case K_SYSC: {
+                IJSlow *sl = &slows[j->nslow];
+
+                memset(&sl->m, 0, sizeof(sl->m));
+                sl->m.akind = A_SYS;
+                sl->m.midx = j->mmu_idx;
+                sl->m.mode = M_IMM;
+                sl->ri = NULL;
+                sl->insn = insn;
+                sl->allslow = true;             /* (always: a b to it) */
+                sl->flags = true;
+                sl->gkind = 0;
+                sl->cbnz2 = NULL;
+                sl->cbnz = j->ptr;
+                emit(j, 0);
+                sl->gslot = 0;
+                sl->ipc = ipc;
+                sl->resume = j->ptr;
+                j->nslow++;
+                break;
+            }
+            case K_SYSEND:
+                /*
+                 * Everything stored, env->pc this insn's; on (from the
+                 * next pc) through a lookup, or to cpu_exec for interrupts
+                 */
+                emit_vstore(j, j->vwritten);
+                emit_sync(j);
+                emit_pc_set(j, ipc);
+                emit(j, i_mov_x(0, H_ENV));
+                emit_movi(j, 1, insn);
+                emit_movi(j, H_TMP0, (uintptr_t)ishjit_sys_end);
+                emit(j, i_blr(H_TMP0));
+                emit_continue_or_exit(j);
+                end_off[i] = ij_offset(j);
+                break;
             case K_MSRDAIF:
             case K_DAIFSET:
             case K_DAIFCLR: {
@@ -3707,6 +4642,17 @@ static int ishjit_gen(CPUState *cs, TranslationBlock *tb, vaddr pc,
 
                 fp_regs(insn, g, &rd, &wr, &vv);
                 mem = (rd | wr) & ENV_HELD;
+                /*
+                 * A non-default FPCR (TB flag FPDEFAULT clear): the host's
+                 * FPCR is the guest's for this insn (its mode bits are
+                 * the A13's own: AHP, DN, FZ, RMode, FZ16), then the host's
+                 * default again
+                 */
+                bool own_fpcr = g->reads_fpcr_mode && !j->fp_default;
+                if (own_fpcr) {
+                    emit_env_far(j, true, H_TMP0, H_TMP0, offsetof(CPUARMState, vfp.fpcr));
+                    emit(j, 0xD51B4400 | H_TMP0);           /* msr fpcr, x16 */
+                }
                 for (int r = 0; r < 31; r++) {
                     tmp[r] = H_NONE;
                     if ((mem >> r) & 1) {
@@ -3731,6 +4677,9 @@ static int ishjit_gen(CPUState *cs, TranslationBlock *tb, vaddr pc,
                     if ((wr >> r) & 1 && g2h[r] == H_NONE) {
                         emit(j, i_str_x(tmp[r], H_ENV, xreg_off(r)));
                     }
+                }
+                if (own_fpcr) {
+                    emit(j, 0xD51B441F);                    /* msr fpcr, xzr */
                 }
                 break;
             }
@@ -3848,13 +4797,26 @@ static int ishjit_gen(CPUState *cs, TranslationBlock *tb, vaddr pc,
 
                 operand_regs(insn, o, &rd, &wr);
                 mem = (rd | wr) & ENV_HELD;
-                for (int g = 0; g < 31; g++) {
-                    tmp[g] = H_NONE;
-                    if ((mem >> g) & 1) {
-                        tmp[g] = next;
-                        next = next == H_TMP0 ? H_TMP1 : H_TMP2;
-                        if ((rd >> g) & 1) {
-                            emit(j, i_ldr_x(tmp[g], H_ENV, xreg_off(g)));
+                {
+                    /*
+                     * (with 4 env-held registers, the destination, only
+                     * written, shares x16 with a source: read before)
+                     */
+                    uint32_t wonly = ctpop32(mem) == 4 ? wr & ~rd & mem : 0;
+
+                    for (int g = 0; g < 31; g++) {
+                        tmp[g] = H_NONE;
+                        if ((mem >> g) & 1 && !((wonly >> g) & 1)) {
+                            tmp[g] = next;
+                            next = next == H_TMP0 ? H_TMP1 : H_TMP2;
+                            if ((rd >> g) & 1) {
+                                emit(j, i_ldr_x(tmp[g], H_ENV, xreg_off(g)));
+                            }
+                        }
+                    }
+                    for (int g = 0; g < 31; g++) {
+                        if ((wonly >> g) & 1) {
+                            tmp[g] = H_TMP0;
                         }
                     }
                 }
@@ -4324,7 +5286,7 @@ static int ishjit_gen_code(CPUState *cs, TranslationBlock *tb, vaddr pc,
     }
     if (!(cflags & CF_PCREL) ||
         (cflags & (CF_USE_ICOUNT | CF_NO_GOTO_TB | CF_NO_GOTO_PTR |
-                   CF_SINGLE_STEP | CF_MEMI_ONLY))) {
+                   CF_SINGLE_STEP))) {
         return ij_decline(env, pc, DR_CFLAGS, cflags);
     }
     if (EX_TBFLAG_ANY(arm_tbflags_from_tb(tb), SS_ACTIVE)) {
@@ -4429,6 +5391,7 @@ void ishjit_env_reset(void *envp)
 void ishjit_enable(void *envp)
 {
     (void)envp;                 /* (routines set at the first translation) */
+
     /* the env offsets the hand-made encodings hold (scaled 12-bit, ldur) */
     QEMU_BUILD_BUG_ON(offsetof(CPUARMState, xregs[31]) / 8 > 4095 ||
                       offsetof(CPUARMState, xregs[0]) % 8);

@@ -121,6 +121,9 @@ void arm_native_fp_sync(CPUARMState *env)
         if (flags) {
             float_raise(flags, &env->vfp.fp_status[FPST_A64]);
         }
+        if (arm_native_fp_take_qc()) {
+            env->vfp.qc[0] = 1;             /* (ishjit's saturating SIMD) */
+        }
     }
 }
 #else

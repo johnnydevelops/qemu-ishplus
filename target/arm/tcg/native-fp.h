@@ -88,12 +88,28 @@ static inline int arm_native_fp_take_flags(void)
     return flags;
 }
 
+/*
+ * FPSR.QC set by saturating SIMD run on the host (ishjit): whether it was
+ * set, and clears it
+ */
+static inline bool arm_native_fp_take_qc(void)
+{
+    uint64_t fpsr;
+
+    asm volatile("mrs %0, fpsr" : "=r"(fpsr) : : "memory");
+    if (likely(!(fpsr & (1u << 27)))) {
+        return false;
+    }
+    asm volatile("msr fpsr, %0" : : "r"(fpsr & ~(uint64_t)(1u << 27)) : "memory");
+    return true;
+}
+
 static inline void arm_native_fp_clear_flags(void)
 {
     uint64_t fpsr;
 
     asm volatile("mrs %0, fpsr" : "=r"(fpsr) : : "memory");
-    asm volatile("msr fpsr, %0" : : "r"(fpsr & ~(uint64_t)0x9f) : "memory");
+    asm volatile("msr fpsr, %0" : : "r"(fpsr & ~(uint64_t)(0x9f | 1u << 27)) : "memory");
 }
 
 /*
