@@ -2977,6 +2977,130 @@ static void st_dump(void)
         }
     }
 }
+/*
+ * Declined TBs (ISHJIT_STATS): what stopped ishjit and how often the TCG TB
+ * ran; ISHJIT_STRICT=1 makes any decline fatal (with what stopped it)
+ */
+enum { DR_INSN, DR_SHORT, DR_NOTA64, DR_CFLAGS, DR_SS, DR_DEBUG, DR_N };
+static const char *dr_name[DR_N] = { "insn at start", "short block", "not a64/pc",
+                                     "cflags", "single step", "debug" };
+static IshjitDecl *decl_list;
+static QemuMutex decl_lock;
+static int decl_stats = -1, decl_strict;
+static int decl_cmp(const void *a, const void *b)
+{
+    const IshjitDecl *x = *(IshjitDecl **)a, *y = *(IshjitDecl **)b;
+    uint64_t wx = x->count * x->icount, wy = y->count * y->icount;
+
+    return wx < wy ? 1 : wx > wy ? -1 : 0;
+}
+static void decl_dump(void)
+{
+    uint64_t n = 0, runs = 0, insns = 0, cls[DR_N][16] = {}, cli[DR_N][16] = {};
+    IshjitDecl **v;
+    int k = 0;
+
+    qemu_mutex_lock(&decl_lock);
+    for (IshjitDecl *d = decl_list; d; d = d->next) {
+        n++;
+    }
+    v = g_new(IshjitDecl *, n + 1);
+    for (IshjitDecl *d = decl_list; d; d = d->next) {
+        v[k++] = d;
+        runs += d->count;
+        insns += d->count * d->icount;
+        cls[d->reason][d->reason <= DR_SHORT ? st_class(d->insn) : 0] += d->count;
+        cli[d->reason][d->reason <= DR_SHORT ? st_class(d->insn) : 0] += d->count * d->icount;
+    }
+    qsort(v, n, sizeof(*v), decl_cmp);
+    fprintf(stderr, "ISHJIT declined TBs %llu, TCG TB runs %llu, TCG insns %llu\n",
+            (unsigned long long)n, (unsigned long long)runs, (unsigned long long)insns);
+    for (int r = 0; r < DR_N; r++) {
+        for (int c = 0; c < 16; c++) {
+            if (cls[r][c]) {
+                fprintf(stderr, "ISHJIT decl %-14s %-26s runs %12llu insns %12llu\n",
+                        dr_name[r], r <= DR_SHORT ? st_name(c) : "",
+                        (unsigned long long)cls[r][c], (unsigned long long)cli[r][c]);
+            }
+        }
+    }
+    /* by stopping insn word (and reason), weighted by insns run */
+    {
+        GHashTable *h = g_hash_table_new(g_int64_hash, g_int64_equal);
+        typedef struct { int64_t key; uint64_t runs, insns, tbs; uint64_t pc; uint8_t el; } Agg;
+        Agg *ag = g_new0(Agg, n + 1);
+        int na = 0;
+
+        for (uint64_t i = 0; i < n; i++) {
+            int64_t key = (int64_t)v[i]->reason << 32 | v[i]->insn;
+            Agg *a = g_hash_table_lookup(h, &key);
+
+            if (!a) {
+                a = &ag[na++];
+                a->key = key;
+                a->pc = v[i]->pc;
+                a->el = v[i]->el;
+                g_hash_table_insert(h, &a->key, a);
+            }
+            a->runs += v[i]->count;
+            a->insns += v[i]->count * v[i]->icount;
+            a->tbs++;
+        }
+        for (int a = 0; a < na; a++) {
+            for (int b = a + 1; b < na; b++) {
+                if (ag[b].insns > ag[a].insns) {
+                    Agg t = ag[a]; ag[a] = ag[b]; ag[b] = t;
+                }
+            }
+            if (a >= 80) {
+                break;
+            }
+        }
+        for (int a = 0; a < na && a < 80; a++) {
+            fprintf(stderr, "ISHJIT dinsn %08x %-13s el%d tbs %6llu runs %11llu insns %12llu  (pc %llx)\n",
+                    (uint32_t)ag[a].key, dr_name[ag[a].key >> 32], ag[a].el,
+                    (unsigned long long)ag[a].tbs, (unsigned long long)ag[a].runs,
+                    (unsigned long long)ag[a].insns, (unsigned long long)ag[a].pc);
+        }
+        g_hash_table_destroy(h);
+        g_free(ag);
+    }
+    g_free(v);
+    qemu_mutex_unlock(&decl_lock);
+}
+static int ij_decline(CPUARMState *env, vaddr pc, int reason, uint32_t insn)
+{
+    if (decl_stats < 0) {
+        const char *s = getenv("ISHJIT_STRICT");
+
+        decl_strict = s && atoi(s);
+        decl_stats = getenv("ISHJIT_STATS") != NULL;
+        qemu_mutex_init(&decl_lock);
+        if (decl_stats) {
+            atexit(decl_dump);
+        }
+    }
+    if (decl_strict) {
+        fprintf(stderr, "ISHJIT STRICT: declined pc %llx el %d: %s, insn %08x\n",
+                (unsigned long long)pc, arm_current_el(env), dr_name[reason], insn);
+        abort();
+    }
+    if (decl_stats) {
+        IshjitDecl *d = g_new0(IshjitDecl, 1);
+
+        d->pc = pc;
+        d->insn = insn;
+        d->reason = reason;
+        d->el = arm_current_el(env);
+        qemu_mutex_lock(&decl_lock);
+        d->next = decl_list;
+        decl_list = d;
+        qemu_mutex_unlock(&decl_lock);
+        ishjit_decl_cur = d;
+    }
+    return ISHJIT_DECLINE;
+}
+
 static void ishjit_stat(int n, uint32_t stop, bool declined)
 {
     static bool init;
@@ -3293,7 +3417,7 @@ static int ishjit_gen(CPUState *cs, TranslationBlock *tb, vaddr pc,
                     ldl_le_p((uint8_t *)host_pc + 4 * n) : 0, n == 0);
     }
     if (n == 0) {
-        return ISHJIT_DECLINE;
+        return ij_decline(env, pc, DR_INSN, ldl_le_p((uint8_t *)host_pc));
     }
     /*
      * Stopped short by an instruction ishjit does not translate: the rest
@@ -3304,7 +3428,7 @@ static int ishjit_gen(CPUState *cs, TranslationBlock *tb, vaddr pc,
      */
     if (n < 16 && n < max_insns && pc + 4 * n < page_end &&
         kinds[n - 1] < K_B) {
-        return ISHJIT_DECLINE;
+        return ij_decline(env, pc, DR_SHORT, ldl_le_p((uint8_t *)host_pc + 4 * n));
     }
     last = n - 1;
 
@@ -4195,12 +4319,16 @@ static int ishjit_gen_code(CPUState *cs, TranslationBlock *tb, vaddr pc,
     if (fwd_on < 0) {
         fwd_on = !getenv("ISHJIT_NOFWD");
     }
-    if (!host_pc || !is_a64(env) || (pc & 3) ||
-        !(cflags & CF_PCREL) ||
+    if (!host_pc || !is_a64(env) || (pc & 3)) {
+        return ij_decline(env, pc, DR_NOTA64, !host_pc);
+    }
+    if (!(cflags & CF_PCREL) ||
         (cflags & (CF_USE_ICOUNT | CF_NO_GOTO_TB | CF_NO_GOTO_PTR |
-                   CF_SINGLE_STEP | CF_MEMI_ONLY)) ||
-        EX_TBFLAG_ANY(arm_tbflags_from_tb(tb), SS_ACTIVE)) {
-        return ISHJIT_DECLINE;
+                   CF_SINGLE_STEP | CF_MEMI_ONLY))) {
+        return ij_decline(env, pc, DR_CFLAGS, cflags);
+    }
+    if (EX_TBFLAG_ANY(arm_tbflags_from_tb(tb), SS_ACTIVE)) {
+        return ij_decline(env, pc, DR_SS, 0);
     }
     /* debugging: ISHJIT_EL0ONLY=1 (user code only), ISHJIT_NOMEM=1 */
     {
@@ -4210,7 +4338,7 @@ static int ishjit_gen_code(CPUState *cs, TranslationBlock *tb, vaddr pc,
             el0only = getenv("ISHJIT_EL0ONLY") != NULL;
         }
         if (el0only && arm_current_el(env) != 0) {
-            return ISHJIT_DECLINE;
+            return ij_decline(env, pc, DR_DEBUG, 0);
         }
     }
     return ishjit_gen(cs, tb, pc, host_pc, max_insns, buf);

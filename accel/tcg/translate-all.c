@@ -292,6 +292,8 @@ static int setjmp_gen_code(CPUArchState *env, TranslationBlock *tb,
 int (*ishjit_gen_code_hook)(CPUState *cs, TranslationBlock *tb, vaddr pc,
                             void *host_pc, int max_insns, void *buf);
 
+__thread IshjitDecl *ishjit_decl_cur;
+
 FILE *ishjit_pmap_get(void)
 {
     static FILE *pmap;
@@ -398,6 +400,10 @@ TranslationBlock *tb_gen_code(CPUState *cpu,
     }
     if (gen_code_size == ISHJIT_DECLINE) {
         gen_code_size = setjmp_gen_code(env, tb, pc, host_pc, &max_insns, &ti);
+        if (ishjit_decl_cur) {
+            ishjit_decl_cur->icount = tb->icount;
+            ishjit_decl_cur = NULL;
+        }
     }
     if (unlikely(gen_code_size < 0)) {
         switch (gen_code_size) {

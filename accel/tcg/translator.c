@@ -12,6 +12,7 @@
 #include "qemu/error-report.h"
 #include "exec/exec-all.h"
 #include "exec/translator.h"
+#include "accel/tcg/ishjit.h"
 #include "exec/cpu_ldst.h"
 #include "exec/plugin-gen.h"
 #include "exec/cpu_ldst.h"
@@ -150,6 +151,15 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
 
     /* Start translating.  */
     icount_start_insn = gen_tb_start(db, cflags);
+    if (ishjit_decl_cur) {
+        /* iSH+ debugging (ISHJIT_STATS): count the runs of a declined TB */
+        TCGv_ptr p = tcg_constant_ptr(&ishjit_decl_cur->count);
+        TCGv_i64 c = tcg_temp_new_i64();
+
+        tcg_gen_ld_i64(c, p, 0);
+        tcg_gen_addi_i64(c, c, 1);
+        tcg_gen_st_i64(c, p, 0);
+    }
     ops->tb_start(db, cpu);
     tcg_debug_assert(db->is_jmp == DISAS_NEXT);  /* no early exit */
 

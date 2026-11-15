@@ -24,6 +24,20 @@ const void *tcg_ishjit_tb_ret_addr(void);
 /* debugging: the ISHJIT_PMAP file, or NULL */
 FILE *ishjit_pmap_get(void);
 
+/*
+ * debugging (ISHJIT_STATS): a TB ishjit declined; TCG's TB counts its runs
+ * in @count (translator_loop), its insns go in @icount after translation
+ */
+typedef struct IshjitDecl {
+    uint64_t count;
+    uint64_t pc;
+    uint32_t insn;              /* (the insn that stopped ishjit, or flags) */
+    uint16_t icount;
+    uint8_t reason, el;
+    struct IshjitDecl *next;
+} IshjitDecl;
+extern __thread IshjitDecl *ishjit_decl_cur;
+
 void ishjit_enable(void *env);    /* (a CPUARMState) */
 void ishjit_env_reset(void *env); /* (after a CPU reset cleared its fields) */
 
