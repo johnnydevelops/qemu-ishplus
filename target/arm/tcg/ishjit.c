@@ -2554,6 +2554,7 @@ typedef struct {
     int gslot;
     vaddr ipc;
     const void *ri;         /* (A_MRSIO: the ARMCPRegInfo) */
+    int8_t src;             /* (a one-byte access from its base: x16 := it first) */
 } IJSlow;
 
 /* x27 = host address of the last byte, x16 = guest address of the last byte */
@@ -2811,17 +2812,23 @@ static void emit_tlb_ldp(IJ *j, int cmp_off)
     }
 }
 
-static void emit_tlb_access(IJ *j, const MemInfo *m, IJSlow *sl, int accsize);
+static void emit_tlb_access(IJ *j, const MemInfo *m, IJSlow *sl, int accsize, int src);
 /* (DC ZVA: x16 the block) */
 static void emit_tlb_access_zva(IJ *j, const MemInfo *m, IJSlow *sl, int bl)
 {
-    emit_tlb_access(j, m, sl, bl);
+    emit_tlb_access(j, m, sl, bl, H_TMP0);
 }
 
 /* The inline TLB check of x16 (its miss: sl's slow path), then the access */
-static void emit_tlb_access(IJ *j, const MemInfo *m, IJSlow *sl, int accsize)
+/*
+ * @src: the register holding the access's first byte: x16, or the base
+ * register itself when the address is just the base (offset 0 or
+ * post-index), saving the move (and for one byte, the last byte's add)
+ */
+static void emit_tlb_access(IJ *j, const MemInfo *m, IJSlow *sl, int accsize, int src)
 {
     unsigned pb = j->page_bits;
+    int last = accsize > 1 ? H_TMP0 : src;
     int cmp_off = m->load ? offsetof(CPUTLBEntry, addr_read)
                           : offsetof(CPUTLBEntry, addr_write);
 
@@ -2850,16 +2857,17 @@ static void emit_tlb_access(IJ *j, const MemInfo *m, IJSlow *sl, int accsize)
      */
     emit(j, 0xA9400000 | ((tlb_fast_off(m->midx) / 8) & 0x7f) << 15 |
             H_TMP2 << 10 | H_ENV << 5 | H_TMP1);            /* ldp x17, x27, [env, #fast] */
-    emit(j, 0x8A000000 | 1 << 22 | H_TMP0 << 16 | (pb - CPU_TLB_ENTRY_BITS) << 10 |
+    emit(j, 0x8A000000 | 1 << 22 | src << 16 | (pb - CPU_TLB_ENTRY_BITS) << 10 |
             H_TMP1 << 5 | H_TMP1);                          /* and x17, x17, x16, lsr #.. */
     emit(j, 0x8B000000 | H_TMP1 << 16 | H_TMP2 << 5 | H_TMP2);  /* add x27, x27, x17 */
     if (accsize > 1) {
-        emit_addi(j, H_TMP0, H_TMP0, accsize - 1);
+        emit_addi(j, H_TMP0, src, accsize - 1);
     }
     emit_tlb_ldp(j, cmp_off);
     emit(j, 0x93C00000 | H_TMP1 << 16 | pb << 10 | H_TMP1 << 5 | H_TMP1);  /* ror x17, x17, #pb */
-    emit(j, 0xCA000000 | 1 << 22 | H_TMP0 << 16 | pb << 10 |
+    emit(j, 0xCA000000 | 1 << 22 | last << 16 | pb << 10 |
             H_TMP1 << 5 | H_TMP1);                          /* eor x17, x17, x16, lsr #pb */
+    sl->src = last == H_TMP0 ? -1 : last;
     sl->cbnz = j->ptr;
     emit(j, 0);                                             /* cbnz x17, slow */
     {
@@ -2872,7 +2880,7 @@ static void emit_tlb_access(IJ *j, const MemInfo *m, IJSlow *sl, int accsize)
             sl->allslow = true;
         }
     }
-    emit(j, 0x8B000000 | H_TMP0 << 16 | H_TMP2 << 5 | H_TMP2);  /* add x27, x27, x16 */
+    emit(j, 0x8B000000 | last << 16 | H_TMP2 << 5 | H_TMP2);  /* add x27, x27, x16 */
 
     emit_access(j, m, accsize);
 }
@@ -3006,6 +3014,7 @@ static void emit_mem_(IJ *j, const MemInfo *m, vaddr ipc, IJSlow *sl)
     int accsize = m->vstruct ? m->vbytes : (1 << m->size) * (m->pair ? 2 : 1);
 
     sl->gkind = 0;
+    sl->src = -1;
     if (j->g_role == 1) {
         /*
          * The group's first access: one TLB check for the whole span of the
@@ -3061,8 +3070,19 @@ static void emit_mem_(IJ *j, const MemInfo *m, vaddr ipc, IJSlow *sl)
         sl->cbnz = j->ptr;
         emit(j, 0);                                 /* b slow */
     } else {
-        emit_addr(j, m, ipc);
-        emit_tlb_access(j, m, sl, accsize);
+        static int basesrc = -1;
+        int src = H_TMP0;
+
+        if (basesrc < 0) {
+            basesrc = !getenv("ISHJIT_NOBASESRC");
+        }
+        if (basesrc && !j->align_mem && m->akind == A_NONE && m->mode == M_IMM &&
+            (m->imm == 0 || m->wb == WB_POST) && g2h[m->rn] != H_NONE) {
+            src = g2h[m->rn];
+        } else {
+            emit_addr(j, m, ipc);
+        }
+        emit_tlb_access(j, m, sl, accsize, src);
     }
     sl->gslot = j->g_slot;
     sl->ipc = ipc;
@@ -3212,6 +3232,9 @@ static void emit_slow(IJ *j, const IJSlow *sl, uint32_t *save, uint32_t *restore
     const MemInfo *m = &sl->m;
     int accsize = m->vstruct ? m->vbytes : (1 << m->size) * (m->pair ? 2 : 1);
 
+    if (sl->src >= 0) {
+        emit(j, i_mov_x(H_TMP0, sl->src));          /* (a byte, from its base) */
+    }
     if (accsize > 1) {
         emit_addi(j, H_TMP0, H_TMP0, -(accsize - 1));
     }
@@ -4620,6 +4643,7 @@ static int ishjit_gen(CPUState *cs, TranslationBlock *tb, vaddr pc,
                 sl->flags = true;
                 sl->gkind = 0;
                 sl->cbnz2 = NULL;
+                sl->src = -1;
                 sl->cbnz = j->ptr;
                 emit(j, 0);
                 sl->gslot = 0;
@@ -4777,6 +4801,7 @@ static int ishjit_gen(CPUState *cs, TranslationBlock *tb, vaddr pc,
                 sl->flags = true;
                 sl->gkind = 0;
                 sl->cbnz2 = NULL;
+                sl->src = -1;
                 sl->cbnz = j->ptr;
                 emit(j, 0);
                 sl->gslot = 0;
