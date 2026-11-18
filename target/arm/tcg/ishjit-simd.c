@@ -28,6 +28,9 @@ static const uint8_t simd_2misc_fp[4]    = { 0x3f, 0x3f, 0x3f, 0xbe };
 static const uint8_t simd_2misc_fp16[4]  = { 0x3f, 0x2f, 0x3f, 0xae };
 static const uint8_t simd_s2misc_fp[4]   = { 0x3c, 0xac, 0x3c, 0x2c };
 
+unsigned ishjit_simd_missing;
+#define MISSING(f) (ishjit_simd_missing & (f))
+
 /* AdvSIMD three same (vector and scalar) */
 static bool simd_3same(uint32_t insn, SimdOperands *g, bool scalar)
 {
@@ -42,6 +45,9 @@ static bool simd_3same(uint32_t insn, SimdOperands *g, bool scalar)
         }
         if ((size & 1) && !q) {
             return false;
+        }
+        if (MISSING(SIMD_NO_FHM) && ((op == 0x1d && u == 0) || (op == 0x19 && u == 1))) {
+            return false;                   /* (FMLAL.., or declined anyway) */
         }
         if (op == 0x1d && u == 0 && (size & 1)) {
             return false;                   /* FMLAL/FMLSL: sz must be 0 */
@@ -97,7 +103,7 @@ static bool simd_3same_extra(uint32_t insn, SimdOperands *g, bool scalar)
     unsigned q = SB(30), u = SB(29), size = SF(22, 2), op = SF(11, 4);
 
     if (!u) {
-        return !scalar && op == 2 && size == 2;     /* SDOT */
+        return !scalar && op == 2 && size == 2 && !MISSING(SIMD_NO_DOTPROD); /* SDOT */
     }
     if (op <= 1) {                                  /* SQRDMLAH/SQRDMLSH */
         g->sets_qc = true;
@@ -107,7 +113,7 @@ static bool simd_3same_extra(uint32_t insn, SimdOperands *g, bool scalar)
         return false;
     }
     if (op == 2) {                                  /* UDOT */
-        return size == 2;
+        return size == 2 && !MISSING(SIMD_NO_DOTPROD);
     }
     if ((op & 0xc) == 0x8 || op == 0xc || op == 0xe) {  /* FCMLA, FCADD */
         g->reads_fpcr_mode = true;
@@ -344,10 +350,10 @@ static bool simd_indexed(uint32_t insn, SimdOperands *g, bool scalar)
         }
         break;
     case 0x0e: case 0x1e:                           /* SDOT / UDOT */
-        return !scalar && size == 2;
+        return !scalar && size == 2 && !MISSING(SIMD_NO_DOTPROD);
     case 0x00: case 0x04: case 0x18: case 0x1c:     /* FMLAL.. FMLSL2 */
         g->reads_fpcr_mode = true;
-        return !scalar && size == 2;
+        return !scalar && size == 2 && !MISSING(SIMD_NO_FHM);
     case 0x11: case 0x13: case 0x15: case 0x17:     /* FCMLA */
         g->reads_fpcr_mode = true;
         if (scalar) {
@@ -429,16 +435,16 @@ static bool simd_shift(uint32_t insn, SimdOperands *g, bool scalar)
 static bool simd_crypto_ce(uint32_t insn)
 {
     if ((insn & 0xff808000) == 0xce000000) {        /* EOR3, BCAX */
-        return SF(21, 2) <= 1;
+        return SF(21, 2) <= 1 && !MISSING(SIMD_NO_SHA3);
     }
     if ((insn & 0xffe00000) == 0xce800000) {        /* XAR */
-        return true;
+        return !MISSING(SIMD_NO_SHA3);
     }
     if ((insn & 0xffe0b000) == 0xce608000) {        /* SHA512H.., RAX1 */
-        return !SB(14);
+        return !SB(14) && !MISSING(SIMD_NO_SHA3 | SIMD_NO_SHA512);
     }
     if ((insn & 0xfffff000) == 0xcec08000) {        /* SHA512SU0 */
-        return SF(10, 2) == 0;
+        return SF(10, 2) == 0 && !MISSING(SIMD_NO_SHA512);
     }
     return false;
 }

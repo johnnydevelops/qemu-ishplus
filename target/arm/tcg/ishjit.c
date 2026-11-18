@@ -2401,8 +2401,35 @@ static int classify_sys(uint32_t insn, IJ *j, unsigned *off, bool *spcheck)
  * arithmetic when the FPCR is not all default (the host's is), and
  * saturating ops (FPSR.QC is not folded back from the host yet).
  */
+/* ishjit_simd_missing, from the guest CPU's features (the same for all) */
+static void simd_features_once(CPUARMState *env)
+{
+    static bool done;
+    ARMCPU *cpu = env_archcpu(env);
+    unsigned missing = 0;
+
+    if (qatomic_read(&done)) {
+        return;
+    }
+    if (!cpu_isar_feature(aa64_dp, cpu)) {
+        missing |= SIMD_NO_DOTPROD;
+    }
+    if (!cpu_isar_feature(aa64_fhm, cpu)) {
+        missing |= SIMD_NO_FHM;
+    }
+    if (!cpu_isar_feature(aa64_sha3, cpu)) {
+        missing |= SIMD_NO_SHA3;
+    }
+    if (!cpu_isar_feature(aa64_sha512, cpu)) {
+        missing |= SIMD_NO_SHA512;
+    }
+    ishjit_simd_missing = missing;
+    qatomic_set(&done, true);
+}
+
 static bool fp_copyable(uint32_t insn, SimdOperands *g, IJ *j)
 {
+    simd_features_once(j->env);
     if (!j->fp_ok || (insn & 0x0E000000) != 0x0E000000 ||
         !ishjit_simd_decode(insn, g)) {
         return false;
@@ -2502,6 +2529,7 @@ static int classify(uint32_t insn, OperandInfo *o, MemInfo *m, bool mem_ok,
     if (!fp_ok) {
         MemInfo t;
 
+        simd_features_once(j->env);
         if (((insn & 0x0E000000) == 0x0E000000 && ishjit_simd_decode(insn, g)) ||
             (decode_mem(insn, &t, true) && t.vec)) {
             return K_SYSEND;            /* (ishjit_sys_do: not a system insn) */

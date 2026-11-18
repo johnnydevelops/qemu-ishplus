@@ -2004,6 +2004,66 @@ static void ishplus_cap_a13(ARMCPU *cpu)
     cpu->isar.id_aa64mmfr1 = t;
 }
 
+#ifdef __APPLE__
+#include <sys/sysctl.h>
+
+/* 1 or 0 for a host feature Darwin reports (hw.optional.arm.FEAT_x), -1 if not */
+static int ishplus_host_has(const char *feature)
+{
+    char name[64];
+    int value = 0;
+    size_t size = sizeof(value);
+
+    snprintf(name, sizeof(name), "hw.optional.arm.%s", feature);
+    if (sysctlbyname(name, &value, &size, NULL, 0) != 0) {
+        return -1;
+    }
+    return value != 0;
+}
+
+#define ISHPLUS_HOST_CAP(feature, reg, R, F, v) \
+    do { if (ishplus_host_has(feature) == 0) ISHPLUS_CAP(reg, R, F, v); } while (0)
+
+/*
+ * iSH+: within the A13 cap, at most what the host CPU has. ishjit runs many
+ * guest instructions as themselves, so the guest must not see a feature the
+ * host lacks (the A12 has no FlagM, LRCPC2, DotProd, FHM or SHA3/SHA512).
+ */
+static void ishplus_cap_host(ARMCPU *cpu)
+{
+    uint64_t t;
+
+    t = cpu->isar.id_aa64isar0;
+    ISHPLUS_HOST_CAP("FEAT_PMULL", t, ID_AA64ISAR0, AES, 1);
+    ISHPLUS_HOST_CAP("FEAT_AES", t, ID_AA64ISAR0, AES, 0);
+    ISHPLUS_HOST_CAP("FEAT_SHA1", t, ID_AA64ISAR0, SHA1, 0);
+    ISHPLUS_HOST_CAP("FEAT_SHA512", t, ID_AA64ISAR0, SHA2, 1);
+    ISHPLUS_HOST_CAP("FEAT_SHA256", t, ID_AA64ISAR0, SHA2, 0);
+    ISHPLUS_HOST_CAP("FEAT_CRC32", t, ID_AA64ISAR0, CRC32, 0);
+    ISHPLUS_HOST_CAP("FEAT_LSE", t, ID_AA64ISAR0, ATOMIC, 0);
+    ISHPLUS_HOST_CAP("FEAT_RDM", t, ID_AA64ISAR0, RDM, 0);
+    ISHPLUS_HOST_CAP("FEAT_SHA3", t, ID_AA64ISAR0, SHA3, 0);
+    ISHPLUS_HOST_CAP("FEAT_DotProd", t, ID_AA64ISAR0, DP, 0);
+    ISHPLUS_HOST_CAP("FEAT_FHM", t, ID_AA64ISAR0, FHM, 0);
+    ISHPLUS_HOST_CAP("FEAT_FlagM", t, ID_AA64ISAR0, TS, 0);
+    cpu->isar.id_aa64isar0 = t;
+
+    t = cpu->isar.id_aa64isar1;
+    ISHPLUS_HOST_CAP("FEAT_DPB", t, ID_AA64ISAR1, DPB, 0);
+    ISHPLUS_HOST_CAP("FEAT_JSCVT", t, ID_AA64ISAR1, JSCVT, 0);
+    ISHPLUS_HOST_CAP("FEAT_FCMA", t, ID_AA64ISAR1, FCMA, 0);
+    ISHPLUS_HOST_CAP("FEAT_LRCPC2", t, ID_AA64ISAR1, LRCPC, 1);
+    ISHPLUS_HOST_CAP("FEAT_LRCPC", t, ID_AA64ISAR1, LRCPC, 0);
+    cpu->isar.id_aa64isar1 = t;
+
+    t = cpu->isar.id_aa64pfr0;
+    ISHPLUS_HOST_CAP("FEAT_FP16", t, ID_AA64PFR0, FP, 0);
+    ISHPLUS_HOST_CAP("FEAT_FP16", t, ID_AA64PFR0, ADVSIMD, 0);
+    ISHPLUS_HOST_CAP("FEAT_DIT", t, ID_AA64PFR0, DIT, 0);
+    cpu->isar.id_aa64pfr0 = t;
+}
+#endif
+
 void arm_cpu_finalize_features(ARMCPU *cpu, Error **errp)
 {
     Error *local_err = NULL;
@@ -2052,6 +2112,9 @@ void arm_cpu_finalize_features(ARMCPU *cpu, Error **errp)
         /* iSH+: a13=on (-cpu max only): at most the A13's instructions */
         if (object_property_find(OBJECT(cpu), "a13") && cpu->prop_a13) {
             ishplus_cap_a13(cpu);
+#ifdef __APPLE__
+            ishplus_cap_host(cpu);
+#endif
         }
 #ifdef TARGET_AARCH64
         /* iSH+: ishjit=on copies guest instructions to the host: A13 ones */
