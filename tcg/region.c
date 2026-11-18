@@ -791,7 +791,15 @@ static int alloc_code_gen_buffer_splitwx_ios(size_t size, Error **errp)
     void *buf_rx = NULL;
     bool from_debugger = false;
 
-    if (is_debugger_attached()) {
+    /*
+     * Before iOS 26 a debugged process maps executable pages itself (below):
+     * no JIT enabler answers the request then, attached or not.
+     */
+    bool ask_debugger = false;
+    if (__builtin_available(iOS 26, *)) {
+        ask_debugger = is_debugger_attached();
+    }
+    if (ask_debugger) {
         /*
          * The debugger allocates first-fit, with no address hint. With no
          * low gap big enough left, it gets 0x7000000000, in the extended
